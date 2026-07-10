@@ -31,8 +31,12 @@ fn main() {
     );
 
 
+    let mut boot_config = bootloader::BootConfig::default();
+    boot_config.frame_buffer_logging = false;
+
     let uefi_path = out_dir.join("uefi.img");
     bootloader::UefiBoot::new(&kernel_elf)
+        .set_boot_config(&boot_config)
         .create_disk_image(&uefi_path)
         .expect("failed to create UEFI disk image");
 
