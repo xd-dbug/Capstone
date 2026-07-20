@@ -8,3 +8,9 @@ bootloader_api = "0.11"
 noto-sans-mono-bitmap = "0.2"
 conquer-once = { version = "0.3.2", default-features = false }
 spin = "0.9.8"
+x86_64 = "0.15.5"
+uart_16550 = "0.6.0"
+
+[[test]]
+name = "should_panic"
+harness = false
