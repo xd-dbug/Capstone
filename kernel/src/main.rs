@@ -11,11 +11,18 @@ use kernel::println;
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         kernel::framebuffer::init(framebuffer);
-        println!("Hello World!");
-    }
+        println!("Hello World{}", "!");
 
-    #[cfg(test)]
-    test_main();
+        kernel::init(); // new
+
+        // invoke a breakpoint exception
+        x86_64::instructions::interrupts::int3();
+
+        #[cfg(test)]
+        test_main();
+
+        println!("It did not crash!");
+    }
 
     loop {}
 }
