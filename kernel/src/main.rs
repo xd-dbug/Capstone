@@ -18,6 +18,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         framebuffer::init(framebuffer);
         println!("Hello World!");
+        panic!("testing panic output");
     }
 
     loop {}
