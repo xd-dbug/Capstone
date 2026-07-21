@@ -10,6 +10,8 @@ use kernel::serial_print;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::InterruptDescriptorTable;
 
+/// Integration test entry point: verifies a kernel stack overflow is caught
+/// as a double fault (via the IST-backed handler) rather than triple-faulting the VM.
 fn test_kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     serial_print!("stack_overflow::stack_overflow...\t");
 
@@ -24,6 +26,7 @@ fn test_kernel_main(_boot_info: &'static mut BootInfo) -> ! {
 
 bootloader_api::entry_point!(test_kernel_main);
 
+/// Recurses until the stack guard page is hit, deliberately triggering the fault under test.
 #[allow(unconditional_recursion)]
 fn stack_overflow() {
     stack_overflow(); // for each recursion, the return address is pushed
@@ -52,6 +55,8 @@ pub fn init_test_idt() {
     TEST_IDT.load();
 }
 
+/// Reaching this handler is the test *passing*: the double fault was caught
+/// safely, so it reports success and exits instead of treating it as a crash.
 extern "x86-interrupt" fn test_double_fault_handler(
     _stack_frame: InterruptStackFrame,
     _error_code: u64,

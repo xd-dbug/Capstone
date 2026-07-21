@@ -8,6 +8,7 @@ use bootloader_api::BootInfo;
 use core::panic::PanicInfo;
 use kernel::println;
 
+/// Kernel entry point invoked by the bootloader once long mode is set up.
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         kernel::framebuffer::init(framebuffer);
@@ -46,6 +47,8 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
+// In test builds, route panics through the shared test harness instead so a
+// failing test reports over serial and exits QEMU rather than hanging.
 #[cfg(test)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

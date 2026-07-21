@@ -5,6 +5,8 @@ use uart_16550::{backend::PioBackend, Config, Uart16550Tty};
 
 static SERIAL1: OnceCell<Mutex<Uart16550Tty<PioBackend>>> = OnceCell::uninit();
 
+/// Initializes the COM1 UART. Called lazily on first use via `SERIAL1.get_or_init`,
+/// so there's no separate init step to remember to call at boot.
 fn init_serial() -> Mutex<Uart16550Tty<PioBackend>> {
     // 0x3F8 is the standard I/O port for the first serial interface (COM1).
     let uart = unsafe {
@@ -13,6 +15,7 @@ fn init_serial() -> Mutex<Uart16550Tty<PioBackend>> {
     Mutex::new(uart)
 }
 
+/// Backing function for the `serial_print!`/`serial_println!` macros.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;

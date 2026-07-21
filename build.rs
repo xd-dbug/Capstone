@@ -2,6 +2,9 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Cross-compiles the `kernel` crate (a separate workspace with its own
+/// target/linker config) as part of the outer crate's build, then exposes the
+/// resulting ELF path to `src/main.rs` via the `KERNEL_ELF` env var.
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let kernel_dir = manifest_dir.join("kernel");

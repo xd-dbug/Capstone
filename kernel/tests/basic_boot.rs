@@ -8,6 +8,8 @@ use bootloader_api::BootInfo;
 use core::panic::PanicInfo;
 use kernel::println;
 
+/// Integration test entry point: boots to a framebuffer and runs the
+/// `#[test_case]`s below, as a smoke test that the kernel reaches this point at all.
 fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         kernel::framebuffer::init(framebuffer);

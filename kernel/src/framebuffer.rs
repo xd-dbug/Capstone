@@ -19,6 +19,8 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// Writes one grayscale pixel, translating `intensity` into the buffer's
+    /// actual pixel format (RGB/BGR replicate it across channels; out-of-bounds is a no-op).
     fn write_pixel(&mut self, x: usize, y: usize, intensity: u8) {
         if x >= self.info.width || y >= self.info.height {
             return;
@@ -40,11 +42,14 @@ impl Writer {
         }
     }
 
+    /// Blanks the whole framebuffer and resets the cursor to the top.
     fn clear(&mut self) {
         self.buffer.fill(0);
         self.y = 0;
     }
 
+    /// Advances to the next line, scrolling by clearing the screen once
+    /// there's no room left for another line (there's no real scroll buffer).
     fn newline(&mut self) {
         self.x = 0;
         if self.y + CHAR_HEIGHT * 2 > self.info.height {
@@ -54,6 +59,7 @@ impl Writer {
         }
     }
 
+    /// Renders one character's glyph at the cursor, wrapping/advancing as needed.
     pub fn write_char(&mut self, c: char) {
         match c {
             '\n' => self.newline(),
@@ -84,6 +90,8 @@ impl fmt::Write for Writer {
     }
 }
 
+/// Sets up the global `WRITER` from the bootloader-provided framebuffer.
+/// Must be called exactly once, before any `print!`/`println!`.
 pub fn init(framebuffer: &'static mut FrameBuffer) {
     let info = framebuffer.info();
     let buffer = framebuffer.buffer_mut();
@@ -97,6 +105,8 @@ pub fn init(framebuffer: &'static mut FrameBuffer) {
     WRITER.init_once(|| Mutex::new(writer));
 }
 
+/// Backing function for the `print!`/`println!` macros. Silently drops
+/// output if `init` hasn't run yet, since there's nowhere to write it.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;

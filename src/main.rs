@@ -8,6 +8,8 @@ const OVMF_VARS: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 /// QEMU's isa-debug-exit device turns a written value `v` into exit code `(v << 1) | 1`.
 const QEMU_TEST_SUCCESS: i32 = 33; // (0x10 << 1) | 1, see kernel::QemuExitCode::Success
 
+/// Custom `cargo run`/`cargo test` runner: boots the kernel (or a test binary)
+/// in QEMU via UEFI, translating the VM's exit code to a cargo-friendly one.
 fn main() {
     // Cargo invokes a configured `runner` as `<runner> <path-to-executable>`. When we're
     // run that way (from kernel/.cargo/config.toml), argv[1] is the kernel or test binary

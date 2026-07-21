@@ -15,15 +15,19 @@ pub mod serial;
 pub mod gdt;
 
 
+/// Anything that can report itself as a named, pass/fail test over serial.
 pub trait Testable {
     fn run(&self) -> ();
 }
 
+/// Brings up CPU-level state needed before anything else can run safely:
+/// segment/TSS descriptors first, then the interrupt handlers that depend on them.
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
 }
 
+// Blanket impl: any zero-arg fn (i.e. every `#[test_case]`) is Testable for free.
 impl<T> Testable for T
 where
     T: Fn(),
@@ -35,6 +39,8 @@ where
     }
 }
 
+/// Custom `#[test_runner]`: runs every collected test, then shuts QEMU down
+/// with a success exit code (there's no OS underneath to return control to).
 pub fn test_runner(tests: &[&dyn Testable]) {
     serial_println!("Running {} tests", tests.len());
     for test in tests {
@@ -43,6 +49,8 @@ pub fn test_runner(tests: &[&dyn Testable]) {
     exit_qemu(QemuExitCode::Success);
 }
 
+/// Shared `#[panic_handler]` for test builds: reports the failure over serial
+/// and exits QEMU with a failure code so `cargo test` sees a non-zero result.
 pub fn test_panic_handler(info: &PanicInfo) -> ! {
     serial_println!("[failed]\n");
     serial_println!("Error: {}\n", info);
@@ -57,6 +65,8 @@ pub enum QemuExitCode {
     Failed = 0x11,
 }
 
+/// Writes to QEMU's `isa-debug-exit` I/O port to terminate the VM with a
+/// specific exit code, standing in for a real "shutdown" syscall in tests.
 pub fn exit_qemu(exit_code: QemuExitCode) {
     use x86_64::instructions::port::Port;
 
