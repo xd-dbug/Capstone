@@ -15,8 +15,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         kernel::init(); // new
 
-        // invoke a breakpoint exception
-        x86_64::instructions::interrupts::int3();
+        // fn stack_overflow() {
+        //     stack_overflow(); // for each recursion, the return address is pushed
+        // }
+        //
+        // // trigger a stack overflow
+        // stack_overflow();
 
         #[cfg(test)]
         test_main();

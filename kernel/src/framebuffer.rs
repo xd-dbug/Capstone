@@ -87,12 +87,13 @@ impl fmt::Write for Writer {
 pub fn init(framebuffer: &'static mut FrameBuffer) {
     let info = framebuffer.info();
     let buffer = framebuffer.buffer_mut();
-    let writer = Writer {
+    let mut writer = Writer {
         buffer,
         info,
         x: 0,
         y: 0,
     };
+    writer.clear();
     WRITER.init_once(|| Mutex::new(writer));
 }
 
