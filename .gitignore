@@ -1,6 +1,6 @@
 /target
 /kernel/target
 error.log
-/docs
 /.claude
 CLAUDE.md
+/docs/
