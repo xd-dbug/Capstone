@@ -1,6 +1,7 @@
 /target
 /kernel/target
 error.log
-/docs
 /.claude
 CLAUDE.md
+/docs/
+/docs/superpowers/specs/
