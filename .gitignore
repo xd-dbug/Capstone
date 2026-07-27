@@ -2,3 +2,5 @@
 /kernel/target
 error.log
 /docs
+/.claude
+CLAUDE.md
