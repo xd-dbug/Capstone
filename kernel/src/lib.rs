@@ -30,10 +30,10 @@ pub fn init() {
     gdt::init();
     interrupts::init_idt();
     unsafe { interrupts::PICS.lock().initialize() };
-    // Unmask only IRQ0 (timer, bit 0) on the master PIC; the slave PIC's
-    // cascade line (IRQ2) and everything else stays masked since no other
-    // device is wired up yet.
-    unsafe { interrupts::PICS.lock().write_masks(0xFE, 0xFF) }
+    // Unmask only IRQ0 (timer, bit 0) and IRQ1 (keyboard, bit 1) on the
+    // master PIC; the slave PIC's cascade line (IRQ2) and everything else
+    // stays masked since no other device is wired up yet.
+    unsafe { interrupts::PICS.lock().write_masks(0xFC, 0xFF) }
     x86_64::instructions::interrupts::enable();
 }
 

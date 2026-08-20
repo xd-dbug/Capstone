@@ -5,6 +5,7 @@ use crate::gdt;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use crate::print;
+use pc_keyboard::{layouts, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
 
 use lazy_static::lazy_static;
 
@@ -23,11 +24,16 @@ lazy_static! {
         }
         idt[InterruptIndex::Timer.as_u8()]
             .set_handler_fn(timer_interrupt_handler);
+        idt[InterruptIndex::Keyboard.as_u8()]
+            .set_handler_fn(keyboard_interrupt_handler);
 
         idt
     };
 }
 
+// Remapped off the default 0x08/0x70 (which overlaps CPU exception vectors)
+// to one past the last CPU exception vector (31), so hardware IRQs and CPU
+// exceptions can never land on the same IDT entry.
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
@@ -81,6 +87,7 @@ fn test_breakpoint_exception() {
 #[repr(u8)]
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
+    Keyboard = InterruptIndex::Timer as u8 + 1,
 }
 
 impl InterruptIndex {
@@ -98,5 +105,42 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     // never delivers another timer interrupt after this one.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+}
+
+// Built once, lazily: the keyboard's decode state (shift/ctrl modifiers,
+// multi-byte scancode sequences in flight) has to persist across interrupts,
+// so it can't just be a local in the handler.
+lazy_static! {
+    static ref KEYBOARD: Mutex<PS2Keyboard<layouts::Us104Key, ScancodeSet1>> = Mutex::new(
+        PS2Keyboard::new(ScancodeSet1::new(), layouts::Us104Key, HandleControl::Ignore)
+    );
+}
+
+/// Reads the scancode the PS/2 controller left on port 0x60 and feeds it
+/// through `pc_keyboard`'s stateful decoder, which may need several scancode
+/// bytes (extended/multi-byte sequences) before it yields a `DecodedKey`.
+extern "x86-interrupt" fn keyboard_interrupt_handler(
+    _stack_frame: InterruptStackFrame)
+{
+    use x86_64::instructions::port::Port;
+
+    let mut port = Port::new(0x60);
+    let scancode: u8 = unsafe { port.read() };
+
+    let mut keyboard = KEYBOARD.lock();
+    if let Ok(Some(key_event)) = keyboard.add_byte(scancode)
+        && let Some(key) = keyboard.process_keyevent(key_event)
+    {
+        match key {
+            DecodedKey::Unicode(character) => print!("{}", character),
+            DecodedKey::RawKey(key) => print!("{:?}", key),
+        }
+    }
+
+    // Without this, the PIC's in-service bit for IRQ1 never clears, so it
+    // never delivers another keyboard interrupt after this one.
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
 }
