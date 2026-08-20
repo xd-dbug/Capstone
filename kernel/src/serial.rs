@@ -16,14 +16,22 @@ fn init_serial() -> Mutex<Uart16550Tty<PioBackend>> {
 }
 
 /// Backing function for the `serial_print!`/`serial_println!` macros.
+///
+/// Runs with interrupts disabled, mirroring `framebuffer::_print`: if this
+/// is ever called from both interrupt and non-interrupt context, the same
+/// non-reentrant-spinlock-vs-ISR deadlock applies here too.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    SERIAL1
-        .get_or_init(init_serial)
-        .lock()
-        .write_fmt(args)
-        .expect("printing to serial failed");
+    use x86_64::instructions::interrupts::without_interrupts;
+
+    without_interrupts(|| {
+        SERIAL1
+            .get_or_init(init_serial)
+            .lock()
+            .write_fmt(args)
+            .expect("printing to serial failed");
+    });
 }
 
 /// Prints to the host through the serial interface.

@@ -21,10 +21,20 @@ pub trait Testable {
 }
 
 /// Brings up CPU-level state needed before anything else can run safely:
-/// segment/TSS descriptors first, then the interrupt handlers that depend on them.
+/// segment/TSS descriptors, then the interrupt handlers that depend on them,
+/// then the PICs (remapped to vectors 32+ so they can't collide with CPU
+/// exception vectors 0-31), then finally interrupts themselves — enabling
+/// them any earlier would let a hardware IRQ arrive before its handler or
+/// the remapped PIC vectors are in place.
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
+    unsafe { interrupts::PICS.lock().initialize() };
+    // Unmask only IRQ0 (timer, bit 0) on the master PIC; the slave PIC's
+    // cascade line (IRQ2) and everything else stays masked since no other
+    // device is wired up yet.
+    unsafe { interrupts::PICS.lock().write_masks(0xFE, 0xFF) }
+    x86_64::instructions::interrupts::enable();
 }
 
 // Blanket impl: any zero-arg fn (i.e. every `#[test_case]`) is Testable for free.

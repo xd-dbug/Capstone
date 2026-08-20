@@ -49,6 +49,7 @@ dependencies = [
  "conquer-once",
  "lazy_static",
  "noto-sans-mono-bitmap",
+ "pic8259",
  "spin",
  "uart_16550",
  "volatile 0.2.7",
@@ -78,6 +79,15 @@ name = "noto-sans-mono-bitmap"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a27daf9557165efe1d09b52f97393bf6283cadb0a76fbe64a1061e15553a994a"
+
+[[package]]
+name = "pic8259"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62d9a86c292b165f757e47e7fd66855def189b2564609bc4203727b27c33db22"
+dependencies = [
+ "x86_64",
+]
 
 [[package]]
 name = "rustversion"

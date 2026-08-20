@@ -46,11 +46,21 @@ struct Selectors {
 /// before `interrupts::init_idt`, which relies on the TSS's IST already being live.
 pub fn init() {
     use x86_64::instructions::tables::load_tss;
-    use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::segmentation::{CS, SS, Segment};
 
     GDT.0.load();
     unsafe {
         CS::set_reg(GDT.1.code_selector);
         load_tss(GDT.1.tss_selector);
+
+        // GDT.0.load() only updates GDTR; segment registers keep whatever
+        // selector value they already held from the bootloader's own GDT.
+        // That old SS value now aliases whatever sits at the same index in
+        // *our* GDT (here, the TSS descriptor) instead of a data segment. SS
+        // isn't validated until it's next reloaded, which `iretq` does on
+        // every interrupt return, so this went unnoticed until the first
+        // hardware interrupt fired and #GP'd trying to reload it. NULL is a
+        // valid SS at CPL0 in long mode, since segmentation is unused here.
+        SS::set_reg(SegmentSelector::NULL);
     }
 }

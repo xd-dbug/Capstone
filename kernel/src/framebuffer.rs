@@ -107,11 +107,20 @@ pub fn init(framebuffer: &'static mut FrameBuffer) {
 
 /// Backing function for the `print!`/`println!` macros. Silently drops
 /// output if `init` hasn't run yet, since there's nowhere to write it.
+///
+/// Runs with interrupts disabled: the timer interrupt handler also calls
+/// `print!`, and since `WRITER`'s spinlock isn't reentrant, a tick landing
+/// while this function already holds the lock would deadlock the ISR
+/// against itself.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
+    use x86_64::instructions::interrupts::without_interrupts;
+
     if let Some(writer) = WRITER.get() {
-        writer.lock().write_fmt(args).ok();
+        without_interrupts(|| {
+            writer.lock().write_fmt(args).ok();
+        });
     }
 }
 
