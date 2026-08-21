@@ -7,13 +7,26 @@
 
 #[cfg(test)]
 use bootloader_api::BootInfo;
+use bootloader_api::{config::Mapping, info::MemoryRegions, BootloaderConfig};
 use core::panic::PanicInfo;
+use spin::Mutex;
 
 pub mod framebuffer;
 pub mod interrupts;
 pub mod serial;
 pub mod gdt;
+pub mod memory;
 
+/// Opts into the bootloader mapping all physical memory into our virtual
+/// address space at `BootInfo::physical_memory_offset`, which the frame
+/// allocator and page-table walker need to turn physical addresses into
+/// dereferenceable pointers. Off by default in `bootloader_api`, so both
+/// real and test entry points must pass this explicitly via `entry_point!`.
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
 
 /// Anything that can report itself as a named, pass/fail test over serial.
 pub trait Testable {
@@ -26,7 +39,14 @@ pub trait Testable {
 /// exception vectors 0-31), then finally interrupts themselves — enabling
 /// them any earlier would let a hardware IRQ arrive before its handler or
 /// the remapped PIC vectors are in place.
-pub fn init() {
+///
+/// Takes the specific `BootInfo` fields the memory subsystem setup (landing
+/// here next) will need, rather than `&'static BootInfo` itself: each entry
+/// point also reborrows `boot_info.framebuffer` as `&'static mut` for
+/// `framebuffer::init`, and the borrow checker cannot prove that borrow is
+/// disjoint from a *whole-struct* reference — only from direct projections
+/// of other individual fields.
+pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions) {
     gdt::init();
     interrupts::init_idt();
     unsafe { interrupts::PICS.lock().initialize() };
@@ -34,6 +54,8 @@ pub fn init() {
     // master PIC; the slave PIC's cascade line (IRQ2) and everything else
     // stays masked since no other device is wired up yet.
     unsafe { interrupts::PICS.lock().write_masks(0xFC, 0xFF) }
+    let allocator = unsafe { memory::BootInfoFrameAllocator::init(memory_regions) };
+    memory::FRAME_ALLOCATOR.init_once(|| Mutex::new(allocator));
     x86_64::instructions::interrupts::enable();
 }
 
@@ -89,16 +111,22 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
 /// Entry point for `cargo test` against this library itself.
 #[cfg(test)]
 fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    let physical_memory_offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("BOOTLOADER_CONFIG enables physical memory mapping");
+    let memory_regions = &boot_info.memory_regions;
+
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         framebuffer::init(framebuffer);
     }
-    init();
+    init(physical_memory_offset, memory_regions);
     test_main();
     loop {}
 }
 
 #[cfg(test)]
-bootloader_api::entry_point!(test_kernel_main);
+bootloader_api::entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
 #[cfg(test)]
 #[panic_handler]

@@ -6,15 +6,21 @@
 
 use bootloader_api::BootInfo;
 use core::panic::PanicInfo;
-use kernel::println;
+use kernel::{println, BOOTLOADER_CONFIG};
 
 /// Kernel entry point invoked by the bootloader once long mode is set up.
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    let physical_memory_offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("BOOTLOADER_CONFIG enables physical memory mapping");
+    let memory_regions = &boot_info.memory_regions;
+
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
         kernel::framebuffer::init(framebuffer);
         println!("Hello World{}", "!");
 
-        kernel::init(); // new
+        kernel::init(physical_memory_offset, memory_regions);
 
         // fn stack_overflow() {
         //     stack_overflow(); // for each recursion, the return address is pushed
@@ -32,7 +38,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     loop {}
 }
 
-bootloader_api::entry_point!(kernel_main);
+bootloader_api::entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 #[test_case]
 fn trivial_assertion() {
