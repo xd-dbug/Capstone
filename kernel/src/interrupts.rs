@@ -6,6 +6,7 @@ use pic8259::ChainedPics;
 use spin::Mutex;
 use crate::print;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use lazy_static::lazy_static;
 
@@ -96,10 +97,20 @@ impl InterruptIndex {
     }
 }
 
+// Relaxed everywhere: this is just a liveness counter, not synchronizing
+// access to anything else, so no ordering guarantees beyond atomicity are
+// needed.
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of timer interrupts handled since boot.
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
-    print!(".");
+    TICKS.fetch_add(1, Ordering::Relaxed);
 
     // Without this, the PIC's in-service bit for IRQ0 never clears, so it
     // never delivers another timer interrupt after this one.
@@ -143,4 +154,15 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
+}
+
+#[test_case]
+fn test_timer_ticks_increase() {
+    let start = ticks();
+    // `hlt` sleeps the CPU until the next interrupt, so this wakes on every
+    // timer tick instead of spinning at full speed while waiting.
+    while ticks() == start {
+        x86_64::instructions::hlt();
+    }
+    assert!(ticks() > start);
 }
