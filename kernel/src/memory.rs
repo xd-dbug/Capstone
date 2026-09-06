@@ -1,12 +1,22 @@
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use conquer_once::spin::OnceCell;
 use spin::Mutex;
-use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PageSize, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{
+    FrameAllocator, FrameDeallocator, OffsetPageTable, PageSize, PageTable, PhysFrame, Size4KiB,
+};
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 
 /// Global handle to the frame allocator, set up once by `kernel::init()`.
 pub static FRAME_ALLOCATOR: OnceCell<Mutex<BootInfoFrameAllocator>> = OnceCell::uninit();
+
+/// Global handle to the virtual memory mapper, set up once by `kernel::init()`
+/// right after `FRAME_ALLOCATOR` — creating a mapping needs frames to back
+/// the page tables it walks or extends, so the two globals are natural
+/// companions. `OffsetPageTable<'static>` is composed entirely of plain data
+/// (a `&'static mut PageTable` and a `VirtAddr` offset), so it's `Send`/`Sync`
+/// for free and needs no extra wrapper beyond the usual `Mutex`.
+pub static MAPPER: OnceCell<Mutex<OffsetPageTable<'static>>> = OnceCell::uninit();
 
 /// Marks the tail of the free list: no valid physical frame's start address
 /// (52-bit max in practice) can ever equal this, so it's safe to use as a
@@ -80,6 +90,54 @@ impl BootInfoFrameAllocator {
     unsafe fn frame_ptr(&self, frame: PhysFrame) -> *mut u64 {
         (self.physical_memory_offset + frame.start_address().as_u64()).as_mut_ptr()
     }
+}
+
+/// Reads CR3 for the physical frame backing the CPU's currently active
+/// level-4 page table, then reaches it through the physical-memory offset
+/// mapping — the same trick `BootInfoFrameAllocator::frame_ptr` uses to turn
+/// a bare physical address into a dereferenceable pointer, since neither
+/// address is otherwise directly usable.
+///
+/// # Safety
+///
+/// `physical_memory_offset` must be the real offset the bootloader mapped all
+/// physical memory at, and this must not be called again while the returned
+/// reference is still alive — a second call would hand out a second `&mut`
+/// to the same physical page table, aliasing the first.
+unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
+    use x86_64::registers::control::Cr3;
+
+    // `PageTable` is `#[repr(align(4096))]`; the CR3 frame is always
+    // page-aligned, so this only holds if the offset itself is too. True for
+    // any offset the `bootloader` crate picks in practice, but not enforced
+    // by its API — see the equivalent check in `BootInfoFrameAllocator::init`.
+    debug_assert!(physical_memory_offset.is_aligned(4096u64));
+
+    let (level_4_table_frame, _) = Cr3::read();
+    let virt = physical_memory_offset + level_4_table_frame.start_address().as_u64();
+    let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
+
+    // Safety: forwarded from this function's own contract — the caller
+    // guarantees the offset mapping is real and that this is the only live
+    // reference to the table CR3 currently points at.
+    unsafe { &mut *page_table_ptr }
+}
+
+/// Builds an `OffsetPageTable` mapper over the CPU's active level-4 page
+/// table, so callers can create or edit virtual-to-physical mappings instead
+/// of only ever allocating raw physical frames.
+///
+/// # Safety
+///
+/// The caller must guarantee the complete physical address space is really
+/// mapped at `physical_memory_offset` (true under `lib.rs`'s
+/// `BOOTLOADER_CONFIG`, which opts into `Mapping::Dynamic`), and must call
+/// this at most once — a second call would produce a second `&mut PageTable`
+/// aliasing the first, since both would borrow the one active level-4 table.
+pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    // Safety: forwarded from this function's own contract.
+    let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
+    unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
 }
 
 // # Safety
@@ -235,4 +293,50 @@ fn test_deallocate_frame_is_reused_before_bump_cursor_advances() {
     let third = allocator.allocate_frame().expect("ran out of usable frames");
     assert_ne!(third, first);
     assert_ne!(third, second);
+}
+
+// Unlike the frame-allocator tests above, this one deliberately mutates the
+// *global* `MAPPER` rather than building a fresh one: `OffsetPageTable::new`
+// borrows the one physical level-4 table `Cr3` points at, so a second
+// instance built here would alias `MAPPER`'s `&mut PageTable` the moment both
+// were live. That's safe only because this is the sole test in this binary
+// that touches page tables, so there's no other test to fight over the
+// shared mapper's state.
+#[test_case]
+fn test_map_unused_page_and_translate_write() {
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags};
+
+    let page = Page::containing_address(VirtAddr::new(0));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    let mut mapper = MAPPER.get().expect("MAPPER not initialized").lock();
+    let mut frame_allocator = FRAME_ALLOCATOR
+        .get()
+        .expect("FRAME_ALLOCATOR not initialized")
+        .lock();
+    let frame = frame_allocator
+        .allocate_frame()
+        .expect("ran out of usable frames");
+
+    // Safety: `page` (virtual address 0, the null page) isn't used by
+    // anything else in this kernel, and `frame` was just freshly allocated,
+    // so this mapping can't alias or corrupt an existing one.
+    let map_result = unsafe { mapper.map_to(page, frame, flags, &mut *frame_allocator) };
+    map_result.expect("map_to failed").flush();
+
+    let value: u64 = 0xf021f077f065f04e; // arbitrary bit pattern to round-trip
+    let page_ptr: *mut u64 = page.start_address().as_mut_ptr();
+    // Safety: `page` was just mapped writable above, and this is the only
+    // code touching it.
+    unsafe {
+        page_ptr.write_volatile(value);
+        assert_eq!(page_ptr.read_volatile(), value, "read back a different value than was written");
+    }
+
+    // Leaving this mapped would make every future null-pointer dereference
+    // in this test binary silently hit this frame instead of faulting,
+    // masking a real bug in some later, unrelated test. Tear it down so
+    // address 0 goes back to being unmapped.
+    let (_, flush) = mapper.unmap(page).expect("unmap of the page we just mapped failed");
+    flush.flush();
 }

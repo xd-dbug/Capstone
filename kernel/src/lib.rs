@@ -41,12 +41,13 @@ pub trait Testable {
 /// them any earlier would let a hardware IRQ arrive before its handler or
 /// the remapped PIC vectors are in place.
 ///
-/// Takes the specific `BootInfo` fields the memory subsystem setup (landing
-/// here next) will need, rather than `&'static BootInfo` itself: each entry
-/// point also reborrows `boot_info.framebuffer` as `&'static mut` for
-/// `framebuffer::init`, and the borrow checker cannot prove that borrow is
-/// disjoint from a *whole-struct* reference — only from direct projections
-/// of other individual fields.
+/// Takes the specific `BootInfo` fields the memory subsystem setup (the
+/// frame allocator and page-table mapper built below) needs, rather than
+/// `&'static BootInfo` itself: each entry point also reborrows
+/// `boot_info.framebuffer` as `&'static mut` for `framebuffer::init`, and
+/// the borrow checker cannot prove that borrow is disjoint from a
+/// *whole-struct* reference — only from direct projections of other
+/// individual fields.
 pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions) {
     gdt::init();
     interrupts::init_idt();
@@ -57,6 +58,16 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
     unsafe { interrupts::PICS.lock().write_masks(0xFC, 0xFF) }
     let allocator = unsafe { memory::BootInfoFrameAllocator::init(memory_regions, VirtAddr::new(physical_memory_offset)) };
     memory::FRAME_ALLOCATOR.init_once(|| Mutex::new(allocator));
+    memory::MAPPER.init_once(|| {
+        // Safety: `BOOTLOADER_CONFIG` opts into `Mapping::Dynamic`, so the
+        // entire physical address space really is mapped at this offset.
+        // `OnceCell::init_once` only ever runs this closure once, which is
+        // what makes it sound to call `memory::init` here rather than
+        // outside the closure — a second call would alias the `&mut
+        // PageTable` `memory::init` builds internally.
+        let mapper = unsafe { memory::init(VirtAddr::new(physical_memory_offset)) };
+        Mutex::new(mapper)
+    });
     x86_64::instructions::interrupts::enable();
 }
 
