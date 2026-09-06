@@ -9,6 +9,7 @@
 use bootloader_api::BootInfo;
 use bootloader_api::{config::Mapping, info::MemoryRegions, BootloaderConfig};
 use core::panic::PanicInfo;
+use x86_64::VirtAddr;
 use spin::Mutex;
 
 pub mod framebuffer;
@@ -54,7 +55,7 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
     // master PIC; the slave PIC's cascade line (IRQ2) and everything else
     // stays masked since no other device is wired up yet.
     unsafe { interrupts::PICS.lock().write_masks(0xFC, 0xFF) }
-    let allocator = unsafe { memory::BootInfoFrameAllocator::init(memory_regions) };
+    let allocator = unsafe { memory::BootInfoFrameAllocator::init(memory_regions, VirtAddr::new(physical_memory_offset)) };
     memory::FRAME_ALLOCATOR.init_once(|| Mutex::new(allocator));
     x86_64::instructions::interrupts::enable();
 }
