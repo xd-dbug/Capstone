@@ -105,4 +105,74 @@ mod tests {
             .expect("FRAME_ALLOCATOR not initialized")
             .lock();
     }
+
+    // Each cycle allocates then immediately drops, so at most one block is
+    // ever live at a time - this is stressing sustained churn (allocate,
+    // free, reuse) rather than peak heap usage, which `HEAP_SIZE` (100 KiB)
+    // couldn't survive if every allocation below stayed alive at once.
+    #[test_case]
+    fn test_alloc_free_stress_cycles() {
+        const CYCLES: usize = 10_000;
+        const SIZES: [usize; 5] = [8, 64, 256, 1024, 4096];
+
+        for i in 0..CYCLES {
+            let size = SIZES[i % SIZES.len()];
+            let pattern = (i % 256) as u8;
+            let mut block: Vec<u8> = Vec::with_capacity(size);
+            block.resize(size, pattern);
+            assert_eq!(block.len(), size);
+            assert!(block.iter().all(|&b| b == pattern));
+            // `block` drops here, freeing back to the allocator before the
+            // next cycle allocates again.
+        }
+    }
+
+    // Uses `alloc::alloc::alloc`/`dealloc` directly rather than `Box`, since
+    // `Box` would trivially always satisfy alignment via the type system -
+    // this exercises `LockedHeap`'s handling of an arbitrary *requested*
+    // alignment instead.
+    #[test_case]
+    fn test_alignment_respected_for_various_alignments() {
+        use alloc::alloc::{alloc, dealloc};
+        use core::alloc::Layout;
+
+        for &align in &[1usize, 2, 4, 8, 16] {
+            let layout = Layout::from_size_align(64, align).expect("valid layout");
+            let ptr = unsafe { alloc(layout) };
+            assert!(!ptr.is_null(), "allocation failed for alignment {}", align);
+            assert_eq!(
+                ptr as usize % align,
+                0,
+                "pointer {:p} not aligned to {}",
+                ptr,
+                align
+            );
+            unsafe { dealloc(ptr, layout) };
+        }
+    }
+
+    // Scatters frees through the free list (rather than freeing everything
+    // in one shot) by keeping roughly a third of ~200 varied-size blocks
+    // alive at a time, then confirms a single large allocation still
+    // succeeds afterward - i.e. the churn above didn't leak usable space the
+    // allocator should have reclaimed.
+    #[test_case]
+    fn test_fragmentation_does_not_leak_usable_space() {
+        const SIZES: [usize; 4] = [16, 128, 512, 32];
+
+        let mut kept: Vec<Vec<u8>> = Vec::new();
+        for i in 0..200 {
+            let size = SIZES[i % SIZES.len()];
+            let block = alloc::vec![i as u8; size];
+            if i % 3 == 0 {
+                kept.push(block);
+            }
+            // else: `block` drops immediately here.
+        }
+        drop(kept);
+
+        let large = alloc::vec![0xAAu8; 40 * 1024]; // 40 KiB, well under HEAP_SIZE (100 KiB)
+        assert_eq!(large.len(), 40 * 1024);
+        assert!(large.iter().all(|&b| b == 0xAA));
+    }
 }
