@@ -15,10 +15,85 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
-- Hardware interrupts beyond breakpoint/double-fault — no PIC remapping, no timer, no keyboard (the `pic8259` dependency is present but unused so far)
+- A `#[test_case]` proving the keyboard handler decodes scancodes correctly (the handler itself works interactively; see the "Done" table below)
+- The kernel's own code/data loaded in the higher half of the address space, and a `#GP` handler (see the "Done" table below)
 - Process scheduling, privilege separation (Ring 3), syscalls, and a shell (capstone-proper deliverables)
 
 If something in the code looks unfinished or stubbed, it probably is — this project is under active, weekly development. Check the commit history rather than assuming this list is current by the time you read it.
+
+ **Done**
+
+Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (process scheduling, Ring 3, syscalls, a shell) is out of scope for this project until the capstone proper and isn't evaluated here — none of it exists yet.
+
+Current test suite backing all the "proven" claims below: **23 tests across 7 test binaries** (`cargo test` from `kernel/`), all passing as of this check.
+
+**1. Bootloader / boot handoff** — done, with one known gap:
+
+| Item | Status | Evidence |
+|---|---|---|
+| UEFI boot via `bootloader`/OVMF | Done | `bootloader = { version = "0.11.16", features = ["uefi"] }`; `entry_point!(kernel_main, config = &BOOTLOADER_CONFIG)` in `main.rs` |
+| `BootInfo` handoff (framebuffer, physical-memory offset, memory map) | Done | Consumed in `main.rs::kernel_main` and every `kernel/tests/*.rs` entry point |
+| Boot ordering enforced (`gdt` → IDT → PIC → heap → `sti`) | Done | `kernel::init()` in `lib.rs`; order is convention-enforced only, not type-enforced (see `docs/design-review-2026-07-21.md` item 3 — local file, not in git) |
+| Kernel loaded in the higher half of the address space | **Not done** | See item 6 below — this is really a paging item, but it's the boot process that determines it |
+
+**2. Framebuffer + serial output** — fully done:
+
+| Item | Status | Evidence |
+|---|---|---|
+| UEFI GOP framebuffer text writer | Done | `framebuffer.rs`: software glyph blitting via `noto-sans-mono-bitmap`, not legacy VGA text mode (unavailable under UEFI/GOP — see `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md`) |
+| `print!`/`println!` macros | Done | `framebuffer.rs`, guarded with `without_interrupts` so the timer ISR's own `print!` can't deadlock against a held lock |
+| Serial output over COM1 | Done | `serial.rs` via `uart_16550`; `serial_print!`/`serial_println!` macros, same `without_interrupts` guard |
+| Proven working | Done | `test_println_simple`, `test_println_many` (`framebuffer.rs`); serial output additionally exercised implicitly by every integration test's `[ok]`/`[failed]` report |
+
+**3. GDT / IDT / CPU exceptions** — done, with one known gap:
+
+| Item | Status | Evidence |
+|---|---|---|
+| GDT with kernel code segment + TSS | Done | `gdt.rs` |
+| Dedicated IST stack for double faults | Done | `gdt.rs`'s `DOUBLE_FAULT_IST_INDEX`, wired to `interrupts.rs`'s `double_fault` handler |
+| Breakpoint (`#BP`) handler | Done | `interrupts.rs`; proven by `test_breakpoint_exception` |
+| Double fault (`#DF`) handler | Done | Proven by `kernel/tests/stack_overflow.rs` (deliberate stack overflow, confirmed caught rather than triple-faulting) |
+| Page fault (`#PF`) handler | Done | Proven by `kernel/tests/page_fault.rs` (deliberate unmapped-address access, confirmed caught rather than triple-faulting/hanging) |
+| General-protection fault (`#GP`) handler | **Not done** | No `#GP` entry in `interrupts.rs`'s IDT. Not urgent pre-capstone — Ring 3 (Layer 4) is where `#GP`s start firing routinely — but tracked as `docs/design-review-2026-07-21.md` item 9 (local file) |
+
+**4. Hardware interrupts (PIC / timer / keyboard)** — implemented, keyboard unproven by automated test:
+
+| Item | Status | Evidence |
+|---|---|---|
+| PIC remapping (vectors 32/40, off the colliding BIOS defaults) | Done | `interrupts.rs`'s `PIC_1_OFFSET`/`PIC_2_OFFSET`, `PICS.lock().initialize()` in `kernel::init()` |
+| Timer (IRQ0) handler + EOI | Done | `timer_interrupt_handler`, `AtomicU64` tick counter; proven by `test_timer_ticks_increase` |
+| Keyboard (IRQ1) handler + EOI | Implemented, not test-proven | `keyboard_interrupt_handler` decodes PS/2 scancodes via `pc-keyboard` and prints the result — works interactively (`cargo run`), but no `#[test_case]` injects a scancode and asserts on the decoded output, unlike every other subsystem here |
+
+**5. Physical memory manager** — fully done:
+
+| Item | Status | Evidence |
+|---|---|---|
+| Bump allocator over `Usable` `BootInfo` regions | Done | `memory.rs`'s `BootInfoFrameAllocator` |
+| Free-list reclamation (`FrameDeallocator`) | Done | Same type; freed frames store their own next-pointer in their backing memory |
+| Proven working | Done | `test_allocate_frames_distinct_and_aligned`, `test_allocate_across_region_boundary`, `test_deallocate_frame_is_reused_before_bump_cursor_advances` |
+
+**6. Paging / virtual memory** — partially done. Two things get called "paging"; only one is actually proven:
+
+| Item | Status | Evidence |
+|---|---|---|
+| Physical-memory offset mapping | Done | `BOOTLOADER_CONFIG` opts into `Mapping::Dynamic`; `memory::init` builds an `OffsetPageTable` over it |
+| Frame allocator backing new mappings | Done | `BootInfoFrameAllocator`, exercised by 3 passing tests above plus `test_map_unused_page_and_translate_write`'s live `map_to`/`unmap` round-trip |
+| Every `map_to`/`unmap` call site flushes correctly | Done | Audited this session (`memory.rs`, `allocator.rs`) — all three call sites flush appropriately for how the mapping is used afterward |
+| Recursive page tables | N/A by design | This project uses `OffsetPageTable` via the bootloader's `Mapping::Dynamic` physical-memory mapping instead — a second, unused implementation was deliberately skipped, not a gap |
+| **Kernel itself loaded in the higher half** | **Not done** | Measured directly this session (temporary probe, reverted after): `test_kernel_main`'s own address prints as `0x205e80` — a low address, nowhere near the higher-half boundary (`0xffff_8000_0000_0000`). `kernel/x86_64-seal_os.json` sets no `relocation-model`/PIE flag, so the kernel links as a static, non-relocatable ELF at its default low load address; `Mappings::kernel_base = Mapping::Dynamic` can only relocate a *position-independent* kernel, so it has no effect here. Mapping physical memory (the item above) and moving the kernel's own code/data to a high address are different things — this repo has only done the first |
+
+**7. Kernel heap allocator** — fully done:
+
+| Item | Status | Evidence |
+|---|---|---|
+| Heap region reserved | Done | `HEAP_START`/`HEAP_SIZE` constants in `kernel/src/allocator.rs` |
+| Heap actually mapped | Done | `init_heap`'s per-page `Mapper::map_to` loop, backed by `FRAME_ALLOCATOR`, called once from `kernel::init()` |
+| Allocator implementation | Done | `linked_list_allocator::LockedHeap` (the linked-list option of the three Oppermann covers) |
+| Registered as global | Done | `#[global_allocator] static ALLOCATOR: LockedHeap` |
+| `alloc` crate usable | Done | `extern crate alloc;` in `lib.rs`; no explicit `#[alloc_error_handler]` — this toolchain's default OOM-abort behavior (stable since ~Rust 1.68) covers it, confirmed by a clean `cargo build` with no missing-lang-item error |
+| Proven working | Done | 7 `#[test_case]`s in `kernel/src/allocator.rs` (`Box`/`Vec` round-trips, a 10,000-cycle stress test, an alignment audit, a fragmentation check) plus 3 more in the dedicated-boot `kernel/tests/heap_allocation.rs` (`Box`, `Vec`, `String`) |
+
+**Not evaluated (out of scope, Layer 4+):** process control blocks, context switching, scheduling, Ring 3/privilege separation, syscalls, a shell. None of this exists in the repo yet — not a gap in this checklist, just outside what pre-capstone is claiming.
 
 ## Architecture
 
@@ -71,13 +146,15 @@ Both commands cross-compile against the custom `x86_64-seal_os.json` target usin
 
 ## Testing
 
-Tests run inside the actual kernel environment rather than on the host, since most of this code can't run under a normal OS. Three kinds exist:
+Tests run inside the actual kernel environment rather than on the host, since most of this code can't run under a normal OS. Two kinds exist:
 
-- **Unit tests** (`#[test_case]` functions inside `kernel/src/`, e.g. `framebuffer.rs`, `interrupts.rs`) — compiled into the kernel binary itself under `cfg(test)`
+- **Unit tests** (`#[test_case]` functions inside `kernel/src/`, e.g. `framebuffer.rs`, `interrupts.rs`, `allocator.rs`, `memory.rs`) — compiled into the kernel binary itself under `cfg(test)`
 - **Integration tests** (`kernel/tests/*.rs`) — each is its own tiny kernel image with its own entry point, boots independently in QEMU:
   - `basic_boot.rs` — smoke test that the kernel reaches framebuffer init and can print
   - `should_panic.rs` — confirms a deliberately failing assertion is correctly detected as a failure
   - `stack_overflow.rs` — deliberately overflows the kernel stack and confirms it's caught as a double fault via the IST-backed handler, rather than triple-faulting the VM
+  - `page_fault.rs` — deliberately dereferences an unmapped address and confirms it's caught as a page fault rather than triple-faulting/hanging the VM
+  - `heap_allocation.rs` — runs a full `kernel::init()` (heap included) and exercises `Box`/`Vec`/`String` end-to-end through the real global allocator
 
 A test binary reports success or failure by writing an exit code to QEMU's `isa-debug-exit` I/O port; `runner` reads QEMU's process exit code and translates it back into something `cargo test` understands.
 
