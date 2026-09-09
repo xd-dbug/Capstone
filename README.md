@@ -10,12 +10,12 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - Serial output over COM1 (`serial_println!`/`serial_print!`) via `uart_16550`
 - GDT with a dedicated Interrupt Stack Table (IST) entry for double faults
 - IDT with breakpoint and double-fault handlers wired up
-- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
+- Physical memory management (bump + free-list physical frame allocator), paging (`OffsetPageTable` virtual memory mapper), and a kernel heap allocator (`linked_list_allocator`, exposing `Box`/`Vec`/`String` via `extern crate alloc`) — Layers 2–3 complete
+- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
 - Hardware interrupts beyond breakpoint/double-fault — no PIC remapping, no timer, no keyboard (the `pic8259` dependency is present but unused so far)
-- Physical memory management, paging, and a heap allocator (Layers 2–3)
 - Process scheduling, privilege separation (Ring 3), syscalls, and a shell (capstone-proper deliverables)
 
 If something in the code looks unfinished or stubbed, it probably is — this project is under active, weekly development. Check the commit history rather than assuming this list is current by the time you read it.
