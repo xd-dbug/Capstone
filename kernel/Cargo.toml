@@ -23,3 +23,7 @@ harness = false
 [[test]]
 name = "stack_overflow"
 harness = false
+
+[[test]]
+name = "page_fault"
+harness = false
