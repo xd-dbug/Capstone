@@ -5,6 +5,8 @@
 #![feature(abi_x86_interrupt)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
 #[cfg(test)]
 use bootloader_api::BootInfo;
 use bootloader_api::{config::Mapping, info::MemoryRegions, BootloaderConfig};
@@ -12,6 +14,7 @@ use core::panic::PanicInfo;
 use x86_64::VirtAddr;
 use spin::Mutex;
 
+pub mod allocator;
 pub mod framebuffer;
 pub mod interrupts;
 pub mod serial;
@@ -68,6 +71,18 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
         let mapper = unsafe { memory::init(VirtAddr::new(physical_memory_offset)) };
         Mutex::new(mapper)
     });
+    // Needs both globals live (the mapper to create the heap's page-table
+    // entries, the frame allocator to back them), so this can't move any
+    // earlier; nothing after this point depends on the heap existing yet,
+    // so it doesn't need to move any later either.
+    allocator::init_heap(
+        &mut *memory::MAPPER.get().expect("MAPPER not initialized").lock(),
+        &mut *memory::FRAME_ALLOCATOR
+            .get()
+            .expect("FRAME_ALLOCATOR not initialized")
+            .lock(),
+    )
+    .expect("heap initialization failed");
     x86_64::instructions::interrupts::enable();
 }
 
