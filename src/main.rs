@@ -2,8 +2,8 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const OVMF_CODE: &str = "/usr/share/OVMF/OVMF_CODE_4M.fd";
-const OVMF_VARS: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
+const OVMF_CODE: &str = "/usr/share/OVMF/x64/OVMF_CODE.4m.fd";
+const OVMF_VARS: &str = "/usr/share/OVMF/x64/OVMF_VARS.4m.fd";
 
 /// QEMU's isa-debug-exit device turns a written value `v` into exit code `(v << 1) | 1`.
 const QEMU_TEST_SUCCESS: i32 = 33; // (0x10 << 1) | 1, see kernel::QemuExitCode::Success
