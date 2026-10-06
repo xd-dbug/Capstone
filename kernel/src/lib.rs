@@ -20,6 +20,7 @@ pub mod interrupts;
 pub mod serial;
 pub mod gdt;
 pub mod memory;
+pub mod task;
 
 /// Opts into the bootloader mapping all physical memory into our virtual
 /// address space at `BootInfo::physical_memory_offset`, which the frame
