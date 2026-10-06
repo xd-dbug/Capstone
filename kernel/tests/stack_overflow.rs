@@ -51,6 +51,8 @@ lazy_static! {
     };
 }
 
+/// Installs the test-local IDT in place of `kernel::interrupts`'s real one,
+/// so the `#DF` is routed to a handler that reports success and exits QEMU.
 pub fn init_test_idt() {
     TEST_IDT.load();
 }

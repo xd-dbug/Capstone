@@ -4,6 +4,9 @@ use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor};
 use x86_64::structures::gdt::SegmentSelector;
 use lazy_static::lazy_static;
 
+/// Which TSS IST slot holds the double-fault stack. Shared with
+/// `interrupts.rs` and `tests/stack_overflow.rs`, whose IDTs must point their
+/// `#DF` entries at the same slot this module populates.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 // Task State Segment: on x86_64 its only real job here is to hold the

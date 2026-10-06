@@ -9,7 +9,7 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - Text output to the framebuffer (`println!`/`print!`) via software-rendered glyphs — not legacy VGA text mode, which isn't available under UEFI/GOP boot (see `docs/superpowers/specs/2026-07-09-vga-text-mode-design.md` for why)
 - Serial output over COM1 (`serial_println!`/`serial_print!`) via `uart_16550`
 - GDT with a dedicated Interrupt Stack Table (IST) entry for double faults
-- IDT with breakpoint and double-fault handlers wired up
+- IDT with breakpoint, double-fault, and page-fault handlers, plus timer (IRQ0) and keyboard (IRQ1) handlers behind remapped PICs
 - Physical memory management (bump + free-list physical frame allocator), paging (`OffsetPageTable` virtual memory mapper), and a kernel heap allocator (`linked_list_allocator`, exposing `Box`/`Vec`/`String` via `extern crate alloc`) — Layers 2–3 complete
 - A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
@@ -23,7 +23,7 @@ If something in the code looks unfinished or stubbed, it probably is — this pr
 
  **Done**
 
-Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (process scheduling, Ring 3, syscalls, a shell) is out of scope for this project until the capstone proper and isn't evaluated here — none of it exists yet.
+Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (process scheduling, Ring 3, syscalls, a shell) has just started (capstone work began 2026-10-05) and isn't evaluated here — none of it exists in the code yet.
 
 Current test suite backing all the "proven" claims below: **23 tests across 7 test binaries** (`cargo test` from `kernel/`), all passing as of this check.
 
@@ -33,7 +33,7 @@ Current test suite backing all the "proven" claims below: **23 tests across 7 te
 |---|---|---|
 | UEFI boot via `bootloader`/OVMF | Done | `bootloader = { version = "0.11.16", features = ["uefi"] }`; `entry_point!(kernel_main, config = &BOOTLOADER_CONFIG)` in `main.rs` |
 | `BootInfo` handoff (framebuffer, physical-memory offset, memory map) | Done | Consumed in `main.rs::kernel_main` and every `kernel/tests/*.rs` entry point |
-| Boot ordering enforced (`gdt` → IDT → PIC → heap → `sti`) | Done | `kernel::init()` in `lib.rs`; order is convention-enforced only, not type-enforced (see `docs/design-review-2026-07-21.md` item 3 — local file, not in git) |
+| Boot ordering enforced (`gdt` → IDT → PIC → frame allocator → mapper → heap → `sti`) | Done | `kernel::init()` in `lib.rs`; order is convention-enforced only, not type-enforced (see `docs/design-review-2026-07-21.md` item 3 — local file, not in git) |
 | Kernel loaded in the higher half of the address space | **Not done** | See item 6 below — this is really a paging item, but it's the boot process that determines it |
 
 **2. Framebuffer + serial output** — fully done:
@@ -114,7 +114,9 @@ Two independent Cargo projects live in this repo:
         ├── framebuffer.rs
         ├── serial.rs
         ├── gdt.rs
-        └── interrupts.rs
+        ├── interrupts.rs
+        ├── memory.rs     # physical frame allocator + OffsetPageTable mapper
+        └── allocator.rs  # kernel heap (#[global_allocator])
 ```
 
 **Why two crates:** `kernel` needs its own target spec, its own `build-std` configuration, and `no_std`. Keeping it a fully separate Cargo project (its own `target/` directory, its own `.cargo/config.toml`) avoids a workspace deadlock where a nested `cargo build` inside `build.rs` blocks on the same build lock as the outer build.
@@ -129,7 +131,7 @@ Two independent Cargo projects live in this repo:
 
 - **Rust nightly**, pinned via `rust-toolchain.toml` (currently `nightly-2026-07-19`) with the `rust-src` component — `rustup` will fetch this automatically the first time you build
 - **QEMU** (`qemu-system-x86_64` on your `PATH`)
-- **OVMF UEFI firmware** — `src/main.rs` currently expects it at `/usr/share/OVMF/OVMF_CODE_4M.fd` and `/usr/share/OVMF/OVMF_VARS_4M.fd` (the standard location on Arch/Debian-based distros via the `ovmf` or `edk2-ovmf` package). If your firmware lives elsewhere, you'll need to edit those constants directly for now — there's no environment-variable override yet.
+- **OVMF UEFI firmware** — `src/main.rs` currently expects it at `/usr/share/OVMF/x64/OVMF_CODE.4m.fd` and `/usr/share/OVMF/x64/OVMF_VARS.4m.fd` (the Arch `edk2-ovmf` package layout; other distros, e.g. Debian/Ubuntu's `ovmf`, lay the files out differently). If your firmware lives elsewhere, you'll need to edit those constants directly for now — there's no environment-variable override yet.
 
 ## Build & run
 
@@ -160,7 +162,7 @@ A test binary reports success or failure by writing an exit code to QEMU's `isa-
 
 ## Roadmap
 
-Pre-capstone (Layers 1–3, in progress) → capstone (Weeks 1–10): process scheduling, Ring 3 privilege separation, syscalls, a basic shell. Capability-based access control, memory-safe syscalls, and ASLR are stretch goals. See the capstone proposal doc for the full schedule.
+Pre-capstone (Layers 1–3, done apart from the gaps listed under "Not implemented yet") → capstone (Weeks 1–10, now underway): process scheduling, Ring 3 privilege separation, syscalls, a basic shell. Capability-based access control, memory-safe syscalls, and ASLR are stretch goals. See the capstone proposal doc for the full schedule.
 
 ## License
 

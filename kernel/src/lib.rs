@@ -40,9 +40,10 @@ pub trait Testable {
 /// Brings up CPU-level state needed before anything else can run safely:
 /// segment/TSS descriptors, then the interrupt handlers that depend on them,
 /// then the PICs (remapped to vectors 32+ so they can't collide with CPU
-/// exception vectors 0-31), then finally interrupts themselves — enabling
-/// them any earlier would let a hardware IRQ arrive before its handler or
-/// the remapped PIC vectors are in place.
+/// exception vectors 0-31), then the frame allocator, page-table mapper, and
+/// heap (in that order, each needing the one before it), and finally
+/// interrupts themselves — enabling them any earlier would let a hardware IRQ
+/// arrive before its handler or the remapped PIC vectors are in place.
 ///
 /// Takes the specific `BootInfo` fields the memory subsystem setup (the
 /// frame allocator and page-table mapper built below) needs, rather than
@@ -117,6 +118,9 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// Values written to `isa-debug-exit`, which turns `v` into process exit code
+/// `(v << 1) | 1`. `Success` therefore becomes 33, which `src/main.rs`'s
+/// `QEMU_TEST_SUCCESS` must stay in sync with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum QemuExitCode {

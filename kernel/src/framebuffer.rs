@@ -11,6 +11,9 @@ const CHAR_WIDTH: usize = get_raster_width(FONT_WEIGHT, CHAR_RASTER_HEIGHT);
 
 static WRITER: OnceCell<Mutex<Writer>> = OnceCell::uninit();
 
+/// Software text console over the pixel framebuffer. Cursor position is in
+/// pixels, not character cells, since glyph size comes from the font constants
+/// above rather than a fixed grid.
 pub struct Writer {
     buffer: &'static mut [u8],
     info: FrameBufferInfo,
@@ -124,11 +127,13 @@ pub fn _print(args: fmt::Arguments) {
     }
 }
 
+/// Prints to the framebuffer console; a no-op until `framebuffer::init` runs.
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::framebuffer::_print(format_args!($($arg)*)));
 }
 
+/// Like `print!`, appending a newline.
 #[macro_export]
 macro_rules! println {
     () => ($crate::print!("\n"));

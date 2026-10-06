@@ -134,3 +134,23 @@ instead of a silent hang.
 - Real legacy `0xb8000` VGA text mode — not available under the current
   `bootloader` 0.11 UEFI configuration; would require a different boot
   pipeline entirely (see Context).
+## Errata (2026-10-05)
+
+The narrative above is left as written; these are the places the implementation
+has since diverged from it.
+
+- **Testing:** "No unit tests" no longer holds. `framebuffer.rs` has
+  `test_println_simple`/`test_println_many`, and `kernel/tests/basic_boot.rs`
+  smoke-tests the framebuffer path under the shared custom test harness
+  (serial-reported, QEMU `isa-debug-exit`).
+- **`print!`/`println!` locking:** `framebuffer::_print` wraps the `WRITER`
+  lock in `without_interrupts` (afb7d50) — the timer ISR also prints, and the
+  spinlock isn't reentrant, so an interrupt landing mid-print deadlocked.
+  The spec's "lock `WRITER` and call `write_fmt`" omits this.
+- **`kernel_main`:** after `framebuffer::init` and the `Hello World!` print it
+  now also calls `kernel::init(...)` (GDT, IDT, PIC, memory, heap, `sti`), and
+  the panic handler lives alongside a separate `cfg(test)` handler that routes
+  through the serial test harness.
+- **Pixel formats:** `Writer::write_pixel` handles `Rgb`/`Bgr` (grayscale
+  replicated across channels) and falls back to a single-byte write for `U8`
+  and any other format, rather than only the RGB-vs-BGR split described.

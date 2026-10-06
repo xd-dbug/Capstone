@@ -27,9 +27,10 @@ const FREE_LIST_END: u64 = u64::MAX;
 /// a singly-linked free list layered on top so `deallocate_frame` can
 /// actually reclaim: each freed frame's own backing memory (reached via the
 /// physical-memory offset mapping) stores the address of the next free
-/// frame, since no heap allocator exists yet to back a real linked-list
-/// type. `allocate_frame` drains the free list before advancing the bump
-/// cursor, so reclaimed frames are reused ahead of untouched memory.
+/// frame. The list can't live on the heap because the heap is itself built
+/// from frames this allocator hands out (`allocator::init_heap`).
+/// `allocate_frame` drains the free list before advancing the bump cursor,
+/// so reclaimed frames are reused ahead of untouched memory.
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryRegions,
     physical_memory_offset: VirtAddr,
@@ -196,7 +197,7 @@ impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
 
 // Each test builds its own `BootInfoFrameAllocator` from `FRAME_ALLOCATOR`'s
 // already-initialized `memory_map`, instead of allocating through the shared
-// global directly — otherwise the two tests would fight over one bump
+// global directly — otherwise the tests would fight over one bump
 // cursor and their results would depend on run order.
 
 #[test_case]

@@ -32,12 +32,16 @@ lazy_static! {
     };
 }
 
-// Remapped off the default 0x08/0x70 (which overlaps CPU exception vectors)
-// to one past the last CPU exception vector (31), so hardware IRQs and CPU
-// exceptions can never land on the same IDT entry.
+/// Remapped off the default 0x08/0x70 (which overlaps CPU exception vectors)
+/// to one past the last CPU exception vector (31), so hardware IRQs and CPU
+/// exceptions can never land on the same IDT entry.
 pub const PIC_1_OFFSET: u8 = 32;
+/// The slave PIC's 8 IRQ lines follow the master's contiguously.
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
+/// Locked from both timer and keyboard ISRs (to send EOI) and from
+/// `kernel::init` (to remap/unmask), so it's one shared `Mutex` rather than
+/// per-handler state.
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
@@ -84,6 +88,8 @@ fn test_breakpoint_exception() {
     x86_64::instructions::interrupts::int3();
 }
 
+/// IDT vectors for the hardware IRQs this kernel handles, derived from
+/// `PIC_1_OFFSET` so they stay correct if the PIC remap offset ever moves.
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {

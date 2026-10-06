@@ -12,8 +12,8 @@ pub const HEAP_START: usize = 0x_4444_4444_0000;
 
 /// 100 KiB: enough to exercise a real allocator (multiple `Vec`/`Box`
 /// allocations, freeing and reuse) without costing much physical memory or
-/// mapping time. Layer 4+ work (if this heap ever needs to grow) is out of
-/// scope for now.
+/// mapping time. The heap is fixed-size and never grows; `init_heap` maps
+/// exactly this much and nothing resizes it afterward.
 pub const HEAP_SIZE: usize = 100 * 1024;
 
 /// `linked_list_allocator`'s `LockedHeap` is a `spin::Mutex` around the free
