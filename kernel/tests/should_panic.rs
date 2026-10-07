@@ -14,7 +14,7 @@ fn test_kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     loop {}
 }
 
-bootloader_api::entry_point!(test_kernel_main);
+bootloader_api::entry_point!(test_kernel_main, config = &kernel::BOOTLOADER_CONFIG);
 
 /// Asserts something false on purpose so the panic handler below can verify
 /// that panicking code is detected correctly (the inverse of a normal test).

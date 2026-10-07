@@ -132,7 +132,8 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 ///
 /// The caller must guarantee the complete physical address space is really
 /// mapped at `physical_memory_offset` (true under `lib.rs`'s
-/// `BOOTLOADER_CONFIG`, which opts into `Mapping::Dynamic`), and must call
+/// `BOOTLOADER_CONFIG`, which opts into
+/// `Mapping::FixedAddress(PHYSICAL_MEMORY_OFFSET)`), and must call
 /// this at most once — a second call would produce a second `&mut PageTable`
 /// aliasing the first, since both would borrow the one active level-4 table.
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {

@@ -25,7 +25,7 @@ fn test_kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     panic!("Execution continued after page fault");
 }
 
-bootloader_api::entry_point!(test_kernel_main);
+bootloader_api::entry_point!(test_kernel_main, config = &kernel::BOOTLOADER_CONFIG);
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

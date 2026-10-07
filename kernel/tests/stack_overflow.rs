@@ -24,7 +24,7 @@ fn test_kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     panic!("Execution continued after stack overflow");
 }
 
-bootloader_api::entry_point!(test_kernel_main);
+bootloader_api::entry_point!(test_kernel_main, config = &kernel::BOOTLOADER_CONFIG);
 
 /// Recurses until the stack guard page is hit, deliberately triggering the fault under test.
 #[allow(unconditional_recursion)]

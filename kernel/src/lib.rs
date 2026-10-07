@@ -22,14 +22,34 @@ pub mod gdt;
 pub mod memory;
 pub mod task;
 
-/// Opts into the bootloader mapping all physical memory into our virtual
-/// address space at `BootInfo::physical_memory_offset`, which the frame
-/// allocator and page-table walker need to turn physical addresses into
-/// dereferenceable pointers. Off by default in `bootloader_api`, so both
-/// real and test entry points must pass this explicitly via `entry_point!`.
+/// Start of the upper (kernel) half of the canonical address space. Everything
+/// the kernel owns lives at or above this so the whole lower half
+/// (`0..0x0000_8000_0000_0000`) stays free for per-process user address
+/// spaces, and the kernel's PML4 entries (256..512) can be shared into each.
+pub const KERNEL_HALF_START: u64 = 0xffff_8000_0000_0000;
+
+/// Where the bootloader maps all physical memory. PML4 entry 256, the very
+/// first upper-half slot; a fixed value (not `Dynamic`) so the layout is
+/// reproducible and the bootloader reserves exactly this entry.
+/// (PML4 ranges below are half-open, `start..end` excluding `end`.)
+pub const PHYSICAL_MEMORY_OFFSET: u64 = KERNEL_HALF_START;
+
+/// Opts into the bootloader mapping all physical memory at
+/// `PHYSICAL_MEMORY_OFFSET`, which the frame allocator and page-table walker
+/// need to turn physical addresses into dereferenceable pointers, and pins
+/// every other bootloader mapping (kernel stack, boot info, framebuffer) into
+/// the dynamic range. That range nominally spans PML4 entries 256..384
+/// (half-open: 256 through 383), but the physical-memory map already claims
+/// 256 and the bootloader hands out whole entries, so in practice the dynamic
+/// mappings land in 257..384. Entries 384..511 (384 through 510) are left for the kernel's own use, e.g.
+/// the heap at `allocator::HEAP_START`; entry 511 holds the kernel image (linked at
+/// `0xffff_ffff_8000_0000`). Both real and test entry points must pass this
+/// explicitly via `entry_point!`.
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.mappings.physical_memory = Some(Mapping::FixedAddress(PHYSICAL_MEMORY_OFFSET));
+    config.mappings.dynamic_range_start = Some(KERNEL_HALF_START);
+    config.mappings.dynamic_range_end = Some(0xffff_bfff_ffff_f000);
     config
 };
 
@@ -64,8 +84,8 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
     let allocator = unsafe { memory::BootInfoFrameAllocator::init(memory_regions, VirtAddr::new(physical_memory_offset)) };
     memory::FRAME_ALLOCATOR.init_once(|| Mutex::new(allocator));
     memory::MAPPER.init_once(|| {
-        // Safety: `BOOTLOADER_CONFIG` opts into `Mapping::Dynamic`, so the
-        // entire physical address space really is mapped at this offset.
+        // Safety: `BOOTLOADER_CONFIG` opts into
+        // `Mapping::FixedAddress(PHYSICAL_MEMORY_OFFSET)`, so the entire physical address space really is mapped at this offset.
         // `OnceCell::init_once` only ever runs this closure once, which is
         // what makes it sound to call `memory::init` here rather than
         // outside the closure — a second call would alias the `&mut
