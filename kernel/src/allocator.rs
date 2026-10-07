@@ -4,11 +4,13 @@ use x86_64::structures::paging::{
 };
 use x86_64::VirtAddr;
 
-/// Chosen arbitrarily high in canonical address space, well clear of the
-/// bootloader's own mappings (physical memory offset, kernel image, boot
-/// info) — the exact value doesn't matter, only that nothing else claims
-/// this virtual range. Matches the "Writing an OS in Rust" tutorial's pick.
-pub const HEAP_START: usize = 0x_4444_4444_0000;
+/// First address of PML4 entry 384, in the upper half. The physical-memory
+/// map sits in entry 256, the bootloader's dynamic mappings are confined to
+/// 257..384 (half-open: 257 through 383; see `BOOTLOADER_CONFIG`), and the
+/// kernel image sits in entry 511, so this entry is guaranteed unclaimed.
+/// Keeping the heap in the upper half leaves the lower half free for user
+/// address spaces.
+pub const HEAP_START: usize = 0xffff_c000_0000_0000;
 
 /// 100 KiB: enough to exercise a real allocator (multiple `Vec`/`Box`
 /// allocations, freeing and reuse) without costing much physical memory or

@@ -12,5 +12,10 @@
   "panic-strategy": "abort",
   "disable-redzone": true,
   "features": "-mmx,-sse,+soft-float",
-  "rustc-abi": "softfloat"
+  "rustc-abi": "softfloat",
+  "code-model": "kernel",
+  "relocation-model": "static",
+  "pre-link-args": {
+    "ld.lld": ["--image-base=0xffffffff80000000"]
+  }
 }

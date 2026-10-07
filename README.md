@@ -11,12 +11,13 @@ A hobby x86_64 kernel written in Rust, built as pre-capstone / capstone (PRO390)
 - GDT with a dedicated Interrupt Stack Table (IST) entry for double faults
 - IDT with breakpoint, double-fault, and page-fault handlers, plus timer (IRQ0) and keyboard (IRQ1) handlers behind remapped PICs
 - Physical memory management (bump + free-list physical frame allocator), paging (`OffsetPageTable` virtual memory mapper), and a kernel heap allocator (`linked_list_allocator`, exposing `Box`/`Vec`/`String` via `extern crate alloc`) — Layers 2–3 complete
-- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
+- Higher-half kernel: the kernel image is linked at `0xffff_ffff_8000_0000` (PML4 entry 511), all physical memory is mapped at `0xffff_8000_0000_0000`, and the heap lives at `0xffff_c000_0000_0000`, leaving the whole lower half free for future user address spaces
+- A custom `#[no_std]` test harness: unit tests inside `kernel/src/`, plus integration tests (`basic_boot`, `should_panic`, `stack_overflow`, `page_fault`, `heap_allocation`, `higher_half`) that boot a real kernel image in QEMU and report pass/fail over the `isa-debug-exit` device
 - `cargo run` and `cargo test` both work end-to-end, cross-compiling the kernel and launching QEMU automatically
 
 **Not implemented yet:**
 - A `#[test_case]` proving the keyboard handler decodes scancodes correctly (the handler itself works interactively; see the "Done" table below)
-- The kernel's own code/data loaded in the higher half of the address space, and a `#GP` handler (see the "Done" table below)
+- A `#GP` handler, and clearing the bootloader's leftover lower-half identity mapping (PML4[0]) before per-process page tables (see the "Done" table below)
 - Process scheduling, privilege separation (Ring 3), syscalls, and a shell (capstone-proper deliverables)
 
 If something in the code looks unfinished or stubbed, it probably is — this project is under active, weekly development. Check the commit history rather than assuming this list is current by the time you read it.
@@ -25,16 +26,16 @@ If something in the code looks unfinished or stubbed, it probably is — this pr
 
 Every subsystem in `kernel/src/` checked line-by-line against the actual repo state and its passing tests, since "done" is easy to over-claim from memory. Organized by the pre-capstone Layer 1–3 scope (bootloader, framebuffer/serial, GDT/IDT, hardware interrupts, physical memory, paging, heap). Each row cites the code/test that backs it — recheck it yourself if it matters for something you're relying on, since this decays the same way the bullets above do. Layer 4+ (process scheduling, Ring 3, syscalls, a shell) has just started (capstone work began 2026-10-05) and isn't evaluated here — none of it exists in the code yet.
 
-Current test suite backing all the "proven" claims below: **23 tests across 7 test binaries** (`cargo test` from `kernel/`), all passing as of this check.
+Current test suite backing all the "proven" claims below: **26 tests across 8 test binaries** (`cargo test` from `kernel/`), all passing as of this check.
 
-**1. Bootloader / boot handoff** — done, with one known gap:
+**1. Bootloader / boot handoff** — done:
 
 | Item | Status | Evidence |
 |---|---|---|
 | UEFI boot via `bootloader`/OVMF | Done | `bootloader = { version = "0.11.16", features = ["uefi"] }`; `entry_point!(kernel_main, config = &BOOTLOADER_CONFIG)` in `main.rs` |
 | `BootInfo` handoff (framebuffer, physical-memory offset, memory map) | Done | Consumed in `main.rs::kernel_main` and every `kernel/tests/*.rs` entry point |
 | Boot ordering enforced (`gdt` → IDT → PIC → frame allocator → mapper → heap → `sti`) | Done | `kernel::init()` in `lib.rs`; order is convention-enforced only, not type-enforced (see `docs/design-review-2026-07-21.md` item 3 — local file, not in git) |
-| Kernel loaded in the higher half of the address space | **Not done** | See item 6 below — this is really a paging item, but it's the boot process that determines it |
+| Kernel loaded in the higher half of the address space | Done | See item 6 below; the target spec links the kernel at `0xffff_ffff_8000_0000` |
 
 **2. Framebuffer + serial output** — fully done:
 
@@ -72,15 +73,17 @@ Current test suite backing all the "proven" claims below: **23 tests across 7 te
 | Free-list reclamation (`FrameDeallocator`) | Done | Same type; freed frames store their own next-pointer in their backing memory |
 | Proven working | Done | `test_allocate_frames_distinct_and_aligned`, `test_allocate_across_region_boundary`, `test_deallocate_frame_is_reused_before_bump_cursor_advances` |
 
-**6. Paging / virtual memory** — partially done. Two things get called "paging"; only one is actually proven:
+**6. Paging / virtual memory** — done (higher-half kernel placement added since the earlier audit), with one known gap (PML4[0]). Two things get called "paging"; both are now proven:
 
 | Item | Status | Evidence |
 |---|---|---|
-| Physical-memory offset mapping | Done | `BOOTLOADER_CONFIG` opts into `Mapping::Dynamic`; `memory::init` builds an `OffsetPageTable` over it |
+| Physical-memory offset mapping | Done | `BOOTLOADER_CONFIG` opts into `Mapping::FixedAddress(PHYSICAL_MEMORY_OFFSET)` (`0xffff_8000_0000_0000`); `memory::init` builds an `OffsetPageTable` over it |
 | Frame allocator backing new mappings | Done | `BootInfoFrameAllocator`, exercised by 3 passing tests above plus `test_map_unused_page_and_translate_write`'s live `map_to`/`unmap` round-trip |
 | Every `map_to`/`unmap` call site flushes correctly | Done | Audited this session (`memory.rs`, `allocator.rs`) — all three call sites flush appropriately for how the mapping is used afterward |
-| Recursive page tables | N/A by design | This project uses `OffsetPageTable` via the bootloader's `Mapping::Dynamic` physical-memory mapping instead — a second, unused implementation was deliberately skipped, not a gap |
-| **Kernel itself loaded in the higher half** | **Not done** | Measured directly this session (temporary probe, reverted after): `test_kernel_main`'s own address prints as `0x205e80` — a low address, nowhere near the higher-half boundary (`0xffff_8000_0000_0000`). `kernel/x86_64-seal_os.json` sets no `relocation-model`/PIE flag, so the kernel links as a static, non-relocatable ELF at its default low load address; `Mappings::kernel_base = Mapping::Dynamic` can only relocate a *position-independent* kernel, so it has no effect here. Mapping physical memory (the item above) and moving the kernel's own code/data to a high address are different things — this repo has only done the first |
+| Recursive page tables | N/A by design | This project uses `OffsetPageTable` via the bootloader's fixed-address physical-memory mapping instead — a second, unused implementation was deliberately skipped, not a gap |
+| Kernel itself loaded in the higher half | Done | `kernel/x86_64-seal_os.json` sets `code-model: kernel`, `relocation-model: static`, and `--image-base=0xffffffff80000000` (static ET_EXEC), so the kernel loads at the top 2 GiB. `BOOTLOADER_CONFIG` pins the physical-memory map to `0xffff_8000_0000_0000` and the bootloader's dynamic mappings (stack, boot info, framebuffer) into PML4 entries 257..384 (half-open). Proven by `kernel/tests/higher_half.rs` |
+| Address-space layout | Done | Lower half (PML4 0..256, half-open) reserved for user space; phys map at 256; bootloader dynamic mappings 257..384; heap (`HEAP_START = 0xffff_c000_0000_0000`) at 384; kernel image at 511 |
+| Bootloader's PML4[0] identity mapping | Known gap | The bootloader's identity mapping of its `context_switch` code and GDT frame is still present in the lower half; safe to clear after `gdt::init()`, but must be dealt with before Ring 3 per-process page tables |
 
 **7. Kernel heap allocator** — fully done:
 
@@ -107,7 +110,7 @@ Two independent Cargo projects live in this repo:
 └── kernel/
     ├── Cargo.toml       # "kernel" — the actual no_std, no_main OS
     ├── .cargo/config.toml   # points kernel's `cargo test` runner back at ../target/debug/runner
-    ├── x86_64-seal_os.json  # custom target spec (softfloat, no SSE/MMX, no red zone)
+    ├── x86_64-seal_os.json  # custom target spec (softfloat, no SSE/MMX, no red zone, kernel code model, linked at `0xffff_ffff_8000_0000`)
     └── src/
         ├── main.rs       # kernel entry point
         ├── lib.rs        # shared init, panic handling, test harness
@@ -156,6 +159,7 @@ Tests run inside the actual kernel environment rather than on the host, since mo
   - `should_panic.rs` — confirms a deliberately failing assertion is correctly detected as a failure
   - `stack_overflow.rs` — deliberately overflows the kernel stack and confirms it's caught as a double fault via the IST-backed handler, rather than triple-faulting the VM
   - `page_fault.rs` — deliberately dereferences an unmapped address and confirms it's caught as a page fault rather than triple-faulting/hanging the VM
+  - `higher_half.rs` — asserts the kernel stack, boot info, framebuffer, heap, and physical-memory map all live in the upper half, and that PML4 entries 256/384/511 are populated
   - `heap_allocation.rs` — runs a full `kernel::init()` (heap included) and exercises `Box`/`Vec`/`String` end-to-end through the real global allocator
 
 A test binary reports success or failure by writing an exit code to QEMU's `isa-debug-exit` I/O port; `runner` reads QEMU's process exit code and translates it back into something `cargo test` understands.
