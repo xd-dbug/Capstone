@@ -1,8 +1,8 @@
 use linked_list_allocator::LockedHeap;
-use x86_64::structures::paging::{
-    mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB,
-};
 use x86_64::VirtAddr;
+use x86_64::structures::paging::{
+    FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
+};
 
 /// First address of PML4 entry 384, in the upper half. The physical-memory
 /// map sits in entry 256, the bootloader's dynamic mappings are confined to
@@ -66,9 +66,11 @@ pub fn init_heap(
 
 #[cfg(test)]
 mod tests {
+    use super::{HEAP_SIZE, HEAP_START};
     use crate::memory::{FRAME_ALLOCATOR, MAPPER};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
+    use x86_64::VirtAddr;
 
     #[test_case]
     fn test_boxed_value_round_trips() {
@@ -177,4 +179,6 @@ mod tests {
         assert_eq!(large.len(), 40 * 1024);
         assert!(large.iter().all(|&b| b == 0xAA));
     }
+
 }
+
