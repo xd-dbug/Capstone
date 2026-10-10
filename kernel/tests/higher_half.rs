@@ -49,7 +49,7 @@ fn test_kernel_code_and_stack_in_upper_half() {
     let local = 0u8;
     assert!(&local as *const u8 as u64 >= KERNEL_HALF_START);
     // Linked at the top 2 GiB so the `kernel` code model is valid.
-    assert!(code_marker as usize as u64 >= 0xffff_ffff_8000_0000);
+    assert!(code_marker as *const () as usize as u64 >= 0xffff_ffff_8000_0000);
 }
 
 #[test_case]
