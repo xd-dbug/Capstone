@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::VirtAddr;
 
@@ -16,6 +17,11 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 /// thread is the first sign this is too small.
 pub const STACK_SIZE: usize = 10 * 1024;
 
+/// Written at the lowest bytes of every heap-backed stack. Heap stacks can't
+/// have an unmapped guard page (see `Task::with_stack`), so an overflow is
+/// only detectable after the fact by checking this wasn't overwritten.
+const STACK_CANARY: u64 = 0xdead_beef_5ea1_c0de;
+
 /// Newtype so IDs can't be mixed up with other `u64`s. `Ord` is meaningful
 /// (lower = created earlier) and lets W2 use it as a `BTreeMap` key.
 #[derive(Debug, PartialEq, Eq, Ord, Copy, Clone, PartialOrd)]
@@ -30,8 +36,8 @@ impl TaskId {
     }
 }
 
-/// Minimal set for cooperative yielding (#11). No `Blocked` yet; add it once
-/// something can actually block (I/O, locks). No `Ord`: states have no
+/// Minimal set for cooperative yielding (`scheduler::yield_now`). No `Blocked`
+/// yet; add it once something can actually block (I/O, locks). No `Ord`: states have no
 /// meaningful ordering, only equality.
 #[derive(PartialEq, Eq, Debug)]
 pub enum TaskState {
@@ -66,7 +72,7 @@ pub struct Task {
     saved_rsp: VirtAddr,
     /// `None` for the boot task, which runs on the bootloader's stack. That
     /// memory isn't from the kernel heap and must never be handed to the heap
-    /// allocator. `Some` for spawned tasks (#13).
+    /// allocator. `Some` for spawned tasks (`Task::with_stack`/`Task::spawn`).
     stack: Option<Box<[u8; STACK_SIZE]>>,
     state: TaskState,
 }
@@ -74,6 +80,7 @@ pub struct Task {
 impl Task {
     /// Call exactly once, to wrap the already-running `kernel_main` context
     /// so the first `switch` out of it has a `Task` to save `rsp` into.
+    /// `scheduler::SCHEDULER`'s lazy initializer is the one caller.
     pub fn boot() -> Task {
         Task {
             id: TaskId::new(),
@@ -84,6 +91,99 @@ impl Task {
             stack: None,
             // Already executing.
             state: TaskState::Running,
+        }
+    }
+
+    /// Creates a non-boot task owning a fresh heap stack, `Ready` but not yet
+    /// runnable: `saved_rsp` is a null placeholder until a first frame is
+    /// written with `context::init_stack`. Prefer `Task::spawn`, which does
+    /// that; this split exists so the stack can be tested without switching.
+    ///
+    /// Stacks live on the kernel heap, not in separately mapped frames with
+    /// an unmapped guard page. A guard page needs a page-aligned virtual
+    /// range per task plus `MAPPER`/`FRAME_ALLOCATOR` locking and a fixed
+    /// region carved out beside the heap; the heap is already mapped and
+    /// zero extra machinery. The cost: an overflow silently corrupts the
+    /// adjacent heap block instead of faulting. `check_canary` narrows that
+    /// gap, but only when someone calls it.
+    pub fn with_stack() -> Task {
+        // `vec![0; n]` goes through `alloc_zeroed` straight into the heap.
+        // `Box::new([0; STACK_SIZE])` in a debug build would first build the
+        // whole 10 KiB array on the current (small) stack.
+        let mut stack: Box<[u8; STACK_SIZE]> = vec![0u8; STACK_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .expect("length is STACK_SIZE by construction");
+        stack[..8].copy_from_slice(&STACK_CANARY.to_ne_bytes());
+        Task {
+            id: TaskId::new(),
+            saved_rsp: VirtAddr::new(0),
+            stack: Some(stack),
+            state: TaskState::Ready,
+        }
+    }
+
+    /// A `Ready` task whose first `switch` enters `entry`. Combines
+    /// `with_stack` with `context::init_stack` so no caller can forget to
+    /// point `saved_rsp` into the new stack.
+    pub fn spawn(entry: extern "C" fn()) -> Task {
+        let mut task = Task::with_stack();
+        let top = task.stack_top().expect("with_stack always has a stack");
+        // Safety: `top` is 16-aligned and the whole heap stack below it is
+        // owned by `task`, which outlives any switch into it.
+        task.saved_rsp = unsafe { crate::context::init_stack(top, entry) };
+        task
+    }
+
+    /// Unique for the life of the kernel; IDs are never reused.
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+
+    /// Scheduler bookkeeping only; nothing here changes what the CPU runs.
+    pub fn state(&self) -> &TaskState {
+        &self.state
+    }
+
+    /// Plain setter: the scheduler, not `Task`, owns the legal transitions.
+    pub fn set_state(&mut self, state: TaskState) {
+        self.state = state;
+    }
+
+    /// The value to pass to `switch` as `new_rsp`.
+    pub fn saved_rsp(&self) -> VirtAddr {
+        self.saved_rsp
+    }
+
+    /// Raw pointer for `switch` to write through, so the scheduler can drop
+    /// its lock before switching. Stays valid while the `Task` is alive and
+    /// not moved; tasks are `Box`ed, so queue shuffling doesn't move it.
+    pub fn saved_rsp_ptr(&mut self) -> *mut VirtAddr {
+        &raw mut self.saved_rsp
+    }
+
+    /// One past the highest usable stack byte, rounded *down* to 16 bytes
+    /// as the SysV ABI requires at call boundaries. `Box<[u8; N]>` only
+    /// guarantees align 1, so up to 15 bytes at the top are left unused.
+    /// `None` for the boot task, whose stack isn't ours.
+    pub fn stack_top(&self) -> Option<VirtAddr> {
+        let stack = self.stack.as_ref()?;
+        let end = stack.as_ptr() as u64 + STACK_SIZE as u64;
+        Some(VirtAddr::new(end & !0xf))
+    }
+
+    /// Lowest address of the stack allocation (where the canary lives).
+    pub fn stack_bottom(&self) -> Option<VirtAddr> {
+        let stack = self.stack.as_ref()?;
+        Some(VirtAddr::new(stack.as_ptr() as u64))
+    }
+
+    /// `false` means the stack overflowed into its canary. Boot task has no
+    /// heap stack to check, so it reports `true`.
+    pub fn check_canary(&self) -> bool {
+        match &self.stack {
+            Some(stack) => stack[..8] == STACK_CANARY.to_ne_bytes(),
+            None => true,
         }
     }
 }

@@ -21,6 +21,8 @@ pub mod serial;
 pub mod gdt;
 pub mod memory;
 pub mod task;
+pub mod context;
+pub mod scheduler;
 
 /// Start of the upper (kernel) half of the canonical address space. Everything
 /// the kernel owns lives at or above this so the whole lower half
@@ -95,8 +97,7 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
     });
     // Needs both globals live (the mapper to create the heap's page-table
     // entries, the frame allocator to back them), so this can't move any
-    // earlier; nothing after this point depends on the heap existing yet,
-    // so it doesn't need to move any later either.
+    // earlier.
     allocator::init_heap(
         &mut *memory::MAPPER.get().expect("MAPPER not initialized").lock(),
         &mut *memory::FRAME_ALLOCATOR
@@ -105,6 +106,8 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
             .lock(),
     )
     .expect("heap initialization failed");
+    // Allocates the boot task's `Box`, so it must follow `init_heap`.
+    scheduler::init();
     x86_64::instructions::interrupts::enable();
 }
 
