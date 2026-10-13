@@ -69,18 +69,29 @@ pub unsafe extern "C" fn switch(old_rsp: *mut VirtAddr, new_rsp: VirtAddr) {
 #[unsafe(naked)]
 unsafe extern "C" fn task_trampoline() -> ! {
     naked_asm!(
+        // rbx (callee-saved) survives the first call and still holds `entry`.
+        // rsp is 16-aligned here, so both calls satisfy the SysV alignment.
+        "call {started}",
         "call rbx",
         "call {exited}",
         "ud2",
+        started = sym task_started,
         exited = sym task_returned,
     )
+}
+
+/// Reaps finished tasks before a fresh task's `entry`, since a first-run task
+/// never passes through the `reap` after `switch` in `yield_now`. Runs on the
+/// task's own stack, mainline context, so freeing here is allowed.
+extern "C" fn task_started() {
+    crate::scheduler::reap();
 }
 
 /// Separate from the trampoline (not inline asm) so the "task is done" logic
 /// stays ordinary Rust. The scheduler marks the task `Finished` and switches
 /// away for good.
 extern "C" fn task_returned() -> ! {
-    crate::scheduler::exit_current()
+    crate::scheduler::exit()
 }
 
 /// Builds the initial frame for a new task and returns the `saved_rsp` to

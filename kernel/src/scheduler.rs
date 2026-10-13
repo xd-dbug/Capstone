@@ -36,8 +36,9 @@ pub(crate) type SwitchArgs = (*mut VirtAddr, VirtAddr);
 struct Scheduler {
     current: Box<Task>,
     ready: VecDeque<Box<Task>>,
-    /// Tasks whose function returned. Their stacks can't be freed by the task
-    /// still running on them, so the next task to run reaps them.
+    /// Tasks whose function returned or called `exit`. Their stacks can't be
+    /// freed by the task still running on them, so the next task to run reaps
+    /// them.
     finished: Vec<Box<Task>>,
 }
 
@@ -47,6 +48,54 @@ impl Scheduler {
     fn is_full(&self) -> bool {
         1 + self.ready.len() + self.finished.len() >= MAX_TASKS
     }
+
+    /// The one round-robin step behind both `select_next` and `exit`: pops
+    /// the front of `ready`, makes it `current`, and files the old `current`
+    /// per `outgoing`. Returns the `switch` arguments, or `None` if nothing
+    /// else is ready.
+    fn rotate(&mut self, outgoing: Outgoing) -> Option<SwitchArgs> {
+        let mut next = self.ready.pop_front()?;
+        // Checked on every rotation, exit included: a task that overflowed
+        // and then exited would otherwise never be checked again.
+        assert!(self.current.check_canary(), "stack overflow in task {:?}", self.current.id());
+        assert!(next.check_canary(), "stack overflow in task {:?}", next.id());
+        debug_assert_eq!(*next.state(), TaskState::Ready);
+
+        let new_rsp = next.saved_rsp();
+        next.set_state(TaskState::Running);
+        let mut prev = core::mem::replace(&mut self.current, next);
+        // Taken before the move into a queue: moving a `Box` keeps the
+        // pointee where it is.
+        let old_rsp = prev.saved_rsp_ptr();
+        // Neither push can grow: both queues are preallocated for
+        // `MAX_TASKS`, `ready` just lost the entry popped above, and
+        // `is_full` counts `finished` toward the cap. A grow would allocate,
+        // which an ISR must not do and which could fail mid-exit.
+        match outgoing {
+            Outgoing::Requeue => {
+                prev.set_state(TaskState::Ready);
+                debug_assert!(self.ready.len() < self.ready.capacity());
+                self.ready.push_back(prev);
+            }
+            Outgoing::Retire => {
+                // Kept alive (not dropped): we are still running on its stack
+                // until the caller's `switch` moves rsp away.
+                prev.set_state(TaskState::Finished);
+                debug_assert!(self.finished.len() < self.finished.capacity());
+                self.finished.push(prev);
+            }
+        }
+        Some((old_rsp, new_rsp))
+    }
+}
+
+/// What `Scheduler::rotate` does with the task it switches away from.
+#[derive(Clone, Copy)]
+enum Outgoing {
+    /// Back of `ready`, to run again (yield, and later preemption).
+    Requeue,
+    /// Into `finished`, for whoever runs next to reap (exit).
+    Retire,
 }
 
 lazy_static! {
@@ -58,7 +107,7 @@ lazy_static! {
         // One slot per task other than `current`, so `select_next` (which
         // an ISR will call) can never need to grow it.
         ready: VecDeque::with_capacity(MAX_TASKS - 1),
-        // Same reasoning: `exit_current` pushes here under the lock, and an
+        // Same reasoning: `exit` pushes here under the lock, and an
         // allocation there could fail mid-exit.
         finished: Vec::with_capacity(MAX_TASKS - 1),
     });
@@ -138,25 +187,7 @@ pub fn ready_count() -> usize {
 /// ISR can preempt (W2), callers must keep interrupts off from here through
 /// `switch`.
 pub(crate) fn select_next() -> Option<SwitchArgs> {
-    with_scheduler(|s| {
-        let mut next = s.ready.pop_front()?;
-        assert!(s.current.check_canary(), "stack overflow in task {:?}", s.current.id());
-        assert!(next.check_canary(), "stack overflow in task {:?}", next.id());
-        debug_assert_eq!(*next.state(), TaskState::Ready);
-
-        let new_rsp = next.saved_rsp();
-        next.set_state(TaskState::Running);
-        let mut prev = core::mem::replace(&mut s.current, next);
-        prev.set_state(TaskState::Ready);
-        // Taken before the move into the queue: moving a `Box` keeps the
-        // pointee where it is.
-        let old_rsp = prev.saved_rsp_ptr();
-        // We just popped one, so there is always a free slot; a grow here
-        // would allocate, which an ISR must not do.
-        debug_assert!(s.ready.len() < s.ready.capacity());
-        s.ready.push_back(prev);
-        Some((old_rsp, new_rsp))
-    })
+    with_scheduler(|s| s.rotate(Outgoing::Requeue))
 }
 
 /// Moves the caller to the back of the queue and runs the front task. Returns
@@ -184,30 +215,34 @@ pub fn yield_now() {
     reap();
 }
 
-/// Called from `task_returned`: retires the running task and never returns.
-pub(crate) fn exit_current() -> ! {
+/// Number of exited tasks whose stacks are still waiting to be freed. Exists
+/// so tests can observe that `reap` ran promptly; not useful for scheduling.
+pub fn finished_count() -> usize {
+    with_scheduler(|s| s.finished.len())
+}
+
+/// Ends the calling task for good, from any call depth. Also what a task's
+/// function returning ends up calling, via `task_returned`.
+///
+/// Destructors of live locals in the abandoned frames do NOT run (the stack is
+/// discarded, not unwound), so anything owning a heap allocation or a lock
+/// guard in those frames leaks or stays locked. Drop such values before
+/// calling this.
+///
+/// Must not be called on the boot task: it runs on the bootloader's stack and
+/// is the scheduler's fallback when the queue would otherwise be empty. Like
+/// `yield_now`, needs interrupts enabled since `switch` doesn't save RFLAGS.
+pub fn exit() -> ! {
+    debug_assert!(
+        x86_64::instructions::interrupts::are_enabled(),
+        "exit called with interrupts disabled"
+    );
     let (old_rsp, new_rsp) = with_scheduler(|s| {
-        // The boot task never returns, so it is always queued while another
+        assert!(s.current.stack_top().is_some(), "the boot task cannot exit");
+        // The boot task never exits, so it is always queued while another
         // task runs; an empty queue means the boot task was lost.
-        let mut next = s
-            .ready
-            .pop_front()
-            .expect("last runnable task finished; no boot task to return to");
-        // Checked here too: a task that overflowed and then returned would
-        // otherwise never pass through `yield_now`'s check again.
-        assert!(s.current.check_canary(), "stack overflow in task {:?}", s.current.id());
-        assert!(next.check_canary(), "stack overflow in task {:?}", next.id());
-        let new_rsp = next.saved_rsp();
-        next.set_state(TaskState::Running);
-        let mut prev = core::mem::replace(&mut s.current, next);
-        prev.set_state(TaskState::Finished);
-        let old_rsp = prev.saved_rsp_ptr();
-        // Kept alive (not dropped) because we are still running on its stack
-        // until `switch` below moves rsp away. Never grows: `finished` is
-        // preallocated and `is_full` counts it toward `MAX_TASKS`.
-        debug_assert!(s.finished.len() < s.finished.capacity());
-        s.finished.push(prev);
-        (old_rsp, new_rsp)
+        s.rotate(Outgoing::Retire)
+            .expect("last runnable task finished; no boot task to return to")
     });
     // Safety: as in `yield_now`; `old_rsp` stays valid because the task sits
     // in `finished` until the next task's `reap`, which runs after this
@@ -217,12 +252,19 @@ pub(crate) fn exit_current() -> ! {
 }
 
 /// Frees stacks of finished tasks. Runs on the resumed task, so `rsp` is
-/// guaranteed to be off the stacks being freed. A task entered for the first
-/// time skips this until its own first `yield_now`; that only delays the free.
-fn reap() {
+/// guaranteed to be off the stacks being freed.
+///
+/// Only ever called from mainline task context: after `switch` in
+/// `yield_now`, and from `context::task_started` before a fresh task's
+/// `entry`. Freeing takes the heap lock, which an ISR must never do (it may
+/// have interrupted the allocator holding that lock, a deadlock;
+/// `allocator::GuardedHeap` panics if it tries), so reaping must stay out of
+/// interrupt handlers. When timer preemption lands, the handler should only
+/// pick and switch; this still runs on the resumed task's mainline path.
+pub(crate) fn reap() {
     // One at a time, each dropped outside the lock: freeing takes the heap
     // lock and needn't nest. Popping (not `mem::take`) keeps `finished`'s
-    // preallocated capacity, so `exit_current` never has to grow it.
+    // preallocated capacity, so `exit` never has to grow it.
     while let Some(dead) = with_scheduler(|s| s.finished.pop()) {
         drop(dead);
     }
