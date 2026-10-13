@@ -305,9 +305,9 @@ pub fn exit() -> ! {
 /// Frees stacks of finished tasks. Runs on the resumed task, so `rsp` is
 /// guaranteed to be off the stacks being freed.
 ///
-/// Only ever called from mainline task context: after `switch` in
-/// `yield_now`, and from `context::task_started` before a fresh task's
-/// `entry`. Freeing takes the heap lock, which an ISR must never do (it may
+/// Only ever called from mainline task context: at the end of `yield_now`,
+/// at the start of `spawn`, and from `context::task_started` before a fresh
+/// task's `entry`. Freeing takes the heap lock, which an ISR must never do (it may
 /// have interrupted the allocator holding that lock, a deadlock;
 /// `allocator::GuardedHeap` panics if it tries), so reaping must stay out of
 /// interrupt handlers. The timer ISR therefore only picks and switches; a
