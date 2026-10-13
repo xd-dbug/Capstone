@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
-use alloc::vec;
+use alloc::collections::TryReserveError;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::VirtAddr;
 
@@ -107,32 +108,43 @@ impl Task {
     /// adjacent heap block instead of faulting. `check_canary` narrows that
     /// gap, but only when someone calls it.
     pub fn with_stack() -> Task {
-        // `vec![0; n]` goes through `alloc_zeroed` straight into the heap.
-        // `Box::new([0; STACK_SIZE])` in a debug build would first build the
-        // whole 10 KiB array on the current (small) stack.
-        let mut stack: Box<[u8; STACK_SIZE]> = vec![0u8; STACK_SIZE]
+        Task::try_with_stack().expect("out of heap memory for a task stack")
+    }
+
+    /// `with_stack` that reports heap exhaustion instead of aborting, for
+    /// `scheduler::spawn`: the heap is 100 KiB, so running out is a normal
+    /// outcome there, not a bug.
+    pub fn try_with_stack() -> Result<Task, TryReserveError> {
+        // Reserve fallibly, then fill: `vec![0; n]` would abort on failure.
+        // Not `Box::new([0; STACK_SIZE])` either, which in a debug build
+        // first builds the whole 10 KiB array on the current (small) stack.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(STACK_SIZE)?;
+        buf.resize(STACK_SIZE, 0);
+        let mut stack: Box<[u8; STACK_SIZE]> = buf
             .into_boxed_slice()
             .try_into()
             .expect("length is STACK_SIZE by construction");
         stack[..8].copy_from_slice(&STACK_CANARY.to_ne_bytes());
-        Task {
+        Ok(Task {
             id: TaskId::new(),
             saved_rsp: VirtAddr::new(0),
             stack: Some(stack),
             state: TaskState::Ready,
-        }
+        })
     }
 
     /// A `Ready` task whose first `switch` enters `entry`. Combines
-    /// `with_stack` with `context::init_stack` so no caller can forget to
-    /// point `saved_rsp` into the new stack.
-    pub fn spawn(entry: extern "C" fn()) -> Task {
-        let mut task = Task::with_stack();
+    /// `try_with_stack` with `context::init_stack` so no caller can forget to
+    /// point `saved_rsp` into the new stack. Fails (without consuming a
+    /// `TaskId`) if the heap can't hold the stack.
+    pub fn spawn(entry: extern "C" fn()) -> Result<Task, TryReserveError> {
+        let mut task = Task::try_with_stack()?;
         let top = task.stack_top().expect("with_stack always has a stack");
         // Safety: `top` is 16-aligned and the whole heap stack below it is
         // owned by `task`, which outlives any switch into it.
         task.saved_rsp = unsafe { crate::context::init_stack(top, entry) };
-        task
+        Ok(task)
     }
 
     /// Unique for the life of the kernel; IDs are never reused.

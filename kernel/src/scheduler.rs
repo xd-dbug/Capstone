@@ -5,7 +5,30 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 use spin::Mutex;
+use x86_64::VirtAddr;
 use x86_64::instructions::interrupts::without_interrupts;
+
+/// Most tasks that can exist at once, boot task included. The heap is 100 KiB
+/// and each spawned task takes a 10 KiB stack, so 8 tasks = 7 stacks = 70 KiB
+/// leaves ~30 KiB for the run queue, `Box<Task>`s and everything else. A 9th
+/// would leave too little to be safe. Also sizes the preallocated `ready` and
+/// `finished` queues, so pushing onto them never grows (allocates).
+pub const MAX_TASKS: usize = 8;
+
+/// Why `spawn` refused. Both are expected outcomes of a small fixed heap, not
+/// bugs, so they are values rather than panics.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SpawnError {
+    /// `MAX_TASKS` tasks already exist.
+    TooManyTasks,
+    /// The heap couldn't hold another stack (e.g. finished tasks' stacks not
+    /// yet reaped, or other allocations eating the budget).
+    OutOfMemory,
+}
+
+/// `switch` arguments produced by `select_next`: where to save the outgoing
+/// rsp, and the rsp to resume.
+pub(crate) type SwitchArgs = (*mut VirtAddr, VirtAddr);
 
 /// Round-robin over any number of tasks: `current` plus a FIFO of the rest.
 /// Tasks are `Box`ed so the address `switch` writes `saved_rsp` through stays
@@ -18,14 +41,26 @@ struct Scheduler {
     finished: Vec<Box<Task>>,
 }
 
+impl Scheduler {
+    /// Live tasks: `current`, the queue, and finished-but-unreaped ones (their
+    /// stacks still occupy the heap, so they count against the budget).
+    fn is_full(&self) -> bool {
+        1 + self.ready.len() + self.finished.len() >= MAX_TASKS
+    }
+}
+
 lazy_static! {
     /// Lazy (not `OnceCell`) so the first call wraps whoever is running, the
     /// boot task, as `current`. Must first be touched after the heap is up;
     /// `init` forces that from `kernel::init` so it never happens implicitly.
     static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler {
         current: Box::new(Task::boot()),
-        ready: VecDeque::new(),
-        finished: Vec::new(),
+        // One slot per task other than `current`, so `select_next` (which
+        // an ISR will call) can never need to grow it.
+        ready: VecDeque::with_capacity(MAX_TASKS - 1),
+        // Same reasoning: `exit_current` pushes here under the lock, and an
+        // allocation there could fail mid-exit.
+        finished: Vec::with_capacity(MAX_TASKS - 1),
     });
 }
 
@@ -48,18 +83,80 @@ pub fn init() {
 }
 
 /// Queues a new task to run on a later `yield_now`. It does not run
-/// immediately.
-pub fn spawn(entry: extern "C" fn()) -> TaskId {
-    let task = Box::new(Task::spawn(entry));
+/// immediately. Fails instead of panicking when `MAX_TASKS` tasks exist or the
+/// heap can't hold the stack.
+///
+/// No allocation or free happens under the lock (the push never grows the
+/// preallocated queue). The cap is checked twice: up front, so the common
+/// refusal costs no memory or `TaskId`, and again under the lock so the check
+/// and the push are one atomic step. A refusal at the second check (or a
+/// failed `Box`) does burn the `TaskId`; IDs are only for identification, so
+/// a gap is harmless.
+pub fn spawn(entry: extern "C" fn()) -> Result<TaskId, SpawnError> {
+    if with_scheduler(|s| s.is_full()) {
+        return Err(SpawnError::TooManyTasks);
+    }
+    let task = Task::spawn(entry).map_err(|_| SpawnError::OutOfMemory)?;
     let id = task.id();
-    with_scheduler(|s| s.ready.push_back(task));
-    id
+    // Fallible: a failed `Box::new` would abort the kernel.
+    let task = Box::try_new(task).map_err(|_| SpawnError::OutOfMemory)?;
+    let rejected = with_scheduler(|s| {
+        if s.is_full() {
+            return Some(task);
+        }
+        s.ready.push_back(task);
+        None
+    });
+    match rejected {
+        // Dropped here, after the lock: freeing the stack takes the heap lock
+        // and needn't nest inside the scheduler's.
+        Some(_task) => Err(SpawnError::TooManyTasks),
+        None => Ok(id),
+    }
 }
 
 /// Number of tasks other than the caller that could run. Lets the boot task
 /// loop `yield_now` until all spawned work is done.
 pub fn ready_count() -> usize {
     with_scheduler(|s| s.ready.len())
+}
+
+/// The one round-robin selection step, shared by `yield_now` and (later) the
+/// timer ISR: pops the front of the queue, makes it `current`, and requeues
+/// the old `current` at the back. Returns the `switch` arguments, or `None` if
+/// nothing else is ready.
+///
+/// Never allocates: the queue was preallocated for `MAX_TASKS` and this only
+/// pops one entry then pushes one back. It only takes the scheduler lock
+/// (with interrupts masked), so lock- and heap-wise it is safe to call from an
+/// interrupt handler. It does not itself switch; the caller drops everything
+/// and calls `switch`.
+///
+/// Once it returns, `current` already names the next task while the CPU is
+/// still on the old one's stack, and the old task's `saved_rsp` isn't written
+/// until `switch`. Nothing may select again in that window, so once the timer
+/// ISR can preempt (W2), callers must keep interrupts off from here through
+/// `switch`.
+pub(crate) fn select_next() -> Option<SwitchArgs> {
+    with_scheduler(|s| {
+        let mut next = s.ready.pop_front()?;
+        assert!(s.current.check_canary(), "stack overflow in task {:?}", s.current.id());
+        assert!(next.check_canary(), "stack overflow in task {:?}", next.id());
+        debug_assert_eq!(*next.state(), TaskState::Ready);
+
+        let new_rsp = next.saved_rsp();
+        next.set_state(TaskState::Running);
+        let mut prev = core::mem::replace(&mut s.current, next);
+        prev.set_state(TaskState::Ready);
+        // Taken before the move into the queue: moving a `Box` keeps the
+        // pointee where it is.
+        let old_rsp = prev.saved_rsp_ptr();
+        // We just popped one, so there is always a free slot; a grow here
+        // would allocate, which an ISR must not do.
+        debug_assert!(s.ready.len() < s.ready.capacity());
+        s.ready.push_back(prev);
+        Some((old_rsp, new_rsp))
+    })
 }
 
 /// Moves the caller to the back of the queue and runs the front task. Returns
@@ -75,22 +172,7 @@ pub fn yield_now() {
         x86_64::instructions::interrupts::are_enabled(),
         "yield_now called with interrupts disabled"
     );
-    let switch_args = with_scheduler(|s| {
-        let mut next = s.ready.pop_front()?;
-        assert!(s.current.check_canary(), "stack overflow in task {:?}", s.current.id());
-        assert!(next.check_canary(), "stack overflow in task {:?}", next.id());
-        debug_assert_eq!(*next.state(), TaskState::Ready);
-
-        let new_rsp = next.saved_rsp();
-        next.set_state(TaskState::Running);
-        let mut prev = core::mem::replace(&mut s.current, next);
-        prev.set_state(TaskState::Ready);
-        // Taken before the move into the queue: moving a `Box` keeps the
-        // pointee where it is.
-        let old_rsp = prev.saved_rsp_ptr();
-        s.ready.push_back(prev);
-        Some((old_rsp, new_rsp))
-    });
+    let switch_args = select_next();
     let Some((old_rsp, new_rsp)) = switch_args else {
         return;
     };
@@ -121,7 +203,9 @@ pub(crate) fn exit_current() -> ! {
         prev.set_state(TaskState::Finished);
         let old_rsp = prev.saved_rsp_ptr();
         // Kept alive (not dropped) because we are still running on its stack
-        // until `switch` below moves rsp away.
+        // until `switch` below moves rsp away. Never grows: `finished` is
+        // preallocated and `is_full` counts it toward `MAX_TASKS`.
+        debug_assert!(s.finished.len() < s.finished.capacity());
         s.finished.push(prev);
         (old_rsp, new_rsp)
     });
@@ -136,7 +220,10 @@ pub(crate) fn exit_current() -> ! {
 /// guaranteed to be off the stacks being freed. A task entered for the first
 /// time skips this until its own first `yield_now`; that only delays the free.
 fn reap() {
-    // Drop outside the lock: freeing takes the heap lock and needn't nest.
-    let dead = with_scheduler(|s| core::mem::take(&mut s.finished));
-    drop(dead);
+    // One at a time, each dropped outside the lock: freeing takes the heap
+    // lock and needn't nest. Popping (not `mem::take`) keeps `finished`'s
+    // preallocated capacity, so `exit_current` never has to grow it.
+    while let Some(dead) = with_scheduler(|s| s.finished.pop()) {
+        drop(dead);
+    }
 }

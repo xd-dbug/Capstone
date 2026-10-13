@@ -76,8 +76,8 @@ extern "C" fn thread_early() {
 
 #[test_case]
 fn test_two_threads_alternate() {
-    spawn(thread_a);
-    spawn(thread_b);
+    spawn(thread_a).unwrap();
+    spawn(thread_b).unwrap();
     run_until_done();
     // Reaching this line also proves control returned to the boot task.
     assert_eq!(take_log(), vec![b'A', b'B', b'A', b'B', b'A', b'B']);
@@ -86,17 +86,17 @@ fn test_two_threads_alternate() {
 
 #[test_case]
 fn test_early_return_while_other_continues() {
-    spawn(thread_early);
-    spawn(thread_b);
+    spawn(thread_early).unwrap();
+    spawn(thread_b).unwrap();
     run_until_done();
     assert_eq!(take_log(), vec![b'C', b'B', b'B', b'B']);
 }
 
 #[test_case]
 fn test_three_threads_round_robin() {
-    spawn(thread_a);
-    spawn(thread_b);
-    spawn(thread_early);
+    spawn(thread_a).unwrap();
+    spawn(thread_b).unwrap();
+    spawn(thread_early).unwrap();
     run_until_done();
     assert_eq!(take_log(), vec![b'A', b'B', b'C', b'A', b'B', b'A', b'B']);
 }
