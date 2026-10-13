@@ -3,6 +3,7 @@ use crate::task::{Task, TaskId, TaskState};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -113,22 +114,44 @@ lazy_static! {
     });
 }
 
+/// Whether the timer ISR may preempt. Off until `init` (so the ISR never
+/// lazily initializes `SCHEDULER`, which allocates) and switchable by
+/// `set_preemption` for tests that assert an exact cooperative interleaving.
+/// Relaxed: it gates a decision, it doesn't publish other memory.
+static PREEMPTION: AtomicBool = AtomicBool::new(false);
+
+/// Turns timer preemption on or off. On is the default once `kernel::init`
+/// has run; off makes scheduling purely cooperative again (switches happen
+/// only in `yield_now`/`exit`), which tests that assert an exact interleaving
+/// need: a tick landing between a log push and a `yield_now` would otherwise
+/// reorder it. Ticks still count while off, they just don't switch.
+pub fn set_preemption(enabled: bool) {
+    PREEMPTION.store(enabled, Ordering::Relaxed);
+}
+
+/// Checked by the timer ISR on every tick.
+pub fn preemption_enabled() -> bool {
+    PREEMPTION.load(Ordering::Relaxed)
+}
+
 /// Locking rule for this module: the lock is only ever held to shuffle
 /// queues and is always dropped *before* `switch`. The resumed task would
 /// otherwise spin on a lock owned by a task that cannot run. Interrupts are
-/// masked while it is held, in case a future IRQ handler (preemption) takes
-/// it: none does today, but one that did would deadlock against the code it
-/// interrupted.
+/// masked while it is held because the timer ISR takes it (via
+/// `select_next`): an ISR spinning on a lock the code it interrupted holds
+/// would deadlock. This is also why the ISR can never find it held.
 fn with_scheduler<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
     without_interrupts(|| f(&mut SCHEDULER.lock()))
 }
 
-/// Wraps the running context as the boot task. Called from `kernel::init`
-/// right after the heap is up, so the boot task deterministically gets the
-/// first `TaskId` (otherwise the first `spawn` would claim an ID before the
-/// lazy initializer ran) and nothing allocates in a lazy init mid-yield.
+/// Wraps the running context as the boot task and turns timer preemption on.
+/// Called from `kernel::init` right after the heap is up, so the boot task
+/// deterministically gets the first `TaskId` (otherwise the first `spawn`
+/// would claim an ID before the lazy initializer ran) and nothing allocates in
+/// a lazy init mid-yield or inside the timer ISR.
 pub fn init() {
     lazy_static::initialize(&SCHEDULER);
+    set_preemption(true);
 }
 
 /// Queues a new task to run on a later `yield_now`. It does not run
@@ -142,6 +165,11 @@ pub fn init() {
 /// failed `Box`) does burn the `TaskId`; IDs are only for identification, so
 /// a gap is harmless.
 pub fn spawn(entry: extern "C" fn()) -> Result<TaskId, SpawnError> {
+    // A task that only ever gets preempted (never yields) never reaps, so
+    // dead stacks could otherwise sit in `finished`, counted by `is_full`
+    // and the heap, and refuse this spawn. `spawn` is mainline, so freeing
+    // here is allowed.
+    reap();
     if with_scheduler(|s| s.is_full()) {
         return Err(SpawnError::TooManyTasks);
     }
@@ -170,10 +198,10 @@ pub fn ready_count() -> usize {
     with_scheduler(|s| s.ready.len())
 }
 
-/// The one round-robin selection step, shared by `yield_now` and (later) the
-/// timer ISR: pops the front of the queue, makes it `current`, and requeues
-/// the old `current` at the back. Returns the `switch` arguments, or `None` if
-/// nothing else is ready.
+/// The one round-robin selection step, shared by `yield_now` and the timer
+/// ISR: pops the front of the queue, makes it `current`, and requeues the old
+/// `current` at the back. Returns the `switch` arguments, or `None` if nothing
+/// else is ready.
 ///
 /// Never allocates: the queue was preallocated for `MAX_TASKS` and this only
 /// pops one entry then pushes one back. It only takes the scheduler lock
@@ -183,35 +211,49 @@ pub fn ready_count() -> usize {
 ///
 /// Once it returns, `current` already names the next task while the CPU is
 /// still on the old one's stack, and the old task's `saved_rsp` isn't written
-/// until `switch`. Nothing may select again in that window, so once the timer
-/// ISR can preempt (W2), callers must keep interrupts off from here through
-/// `switch`.
+/// until `switch` stores it. If the timer ISR selected again in that window
+/// it would requeue a task that was never saved, and the next resume would
+/// jump through a stale `saved_rsp`. The window is closed by the callers, not
+/// here: the ISR has IF=0 from its gate, and `yield_now`/`exit` hold
+/// interrupts off from before the selection through `switch`. Any new caller
+/// must do the same.
 pub(crate) fn select_next() -> Option<SwitchArgs> {
     with_scheduler(|s| s.rotate(Outgoing::Requeue))
 }
 
 /// Moves the caller to the back of the queue and runs the front task. Returns
-/// (later) once every other task ahead of it has yielded or finished; returns
-/// at once if nothing else is ready.
+/// (later) once every other task ahead of it has yielded, been preempted or
+/// finished; returns at once if nothing else is ready.
 ///
-/// Must be called with interrupts enabled: `switch` doesn't save RFLAGS, so
-/// the interrupt flag isn't per-task, and calling this with IF=0 would hand
-/// the next task a CPU with interrupts silently off. Preemption (W2) will
-/// need IF in the saved state instead.
+/// Selection and `switch` run inside one `without_interrupts`: a timer tick
+/// between them would select again before this task's rsp was saved (see
+/// `select_next`). That wrapper is also what makes IF per-task here: the IF
+/// to restore sits in the wrapper's frame on *this task's* stack, so whenever
+/// this task is resumed (by a later yield or by a preemption's `switch` back
+/// into it) it re-enables or leaves masked exactly what its own caller had.
+/// Hence it is also legal, if pointless, to call this with interrupts off.
+///
+/// Reaps on the way out even when nothing else was ready: this is mainline
+/// code, and a task that was preempted away from (rather than yielded away
+/// from) never reaps on resume, since the ISR path must not free.
 pub fn yield_now() {
+    // IF=0 is no longer a reliable "we're in an ISR" signal (yielding inside
+    // `without_interrupts` is legal now), so check the depth directly. From a
+    // handler this would switch with no EOI and no `ISR_DEPTH` hand-off.
     debug_assert!(
-        x86_64::instructions::interrupts::are_enabled(),
-        "yield_now called with interrupts disabled"
+        !crate::interrupts::in_interrupt(),
+        "yield_now called from interrupt context"
     );
-    let switch_args = select_next();
-    let Some((old_rsp, new_rsp)) = switch_args else {
-        return;
-    };
-    // Safety: `old_rsp` points into the heap-allocated `Task` now in `ready`
-    // (alive, boxed, never freed while queued). `new_rsp` came from a
-    // `Ready` task's `init_stack` or earlier `switch`. No lock is held.
-    unsafe { switch(old_rsp, new_rsp) };
-    // Only reached once someone switches back to us, now on our own stack.
+    without_interrupts(|| {
+        if let Some((old_rsp, new_rsp)) = select_next() {
+            // Safety: `old_rsp` points into the heap-allocated `Task` now in
+            // `ready` (alive, boxed, never freed while queued). `new_rsp`
+            // came from a `Ready` task's `init_stack`, an earlier `switch`
+            // or a preemption's `switch_from_isr`. No lock is held.
+            unsafe { switch(old_rsp, new_rsp) };
+            // Only reached once someone switches back to us, on our own stack.
+        }
+    });
     reap();
 }
 
@@ -230,24 +272,33 @@ pub fn finished_count() -> usize {
 /// calling this.
 ///
 /// Must not be called on the boot task: it runs on the bootloader's stack and
-/// is the scheduler's fallback when the queue would otherwise be empty. Like
-/// `yield_now`, needs interrupts enabled since `switch` doesn't save RFLAGS.
+/// is the scheduler's fallback when the queue would otherwise be empty.
+///
+/// As in `yield_now`, rotation and `switch` share one `without_interrupts`.
+/// Here that matters doubly: once the task is in `finished`, a tick that
+/// preempted it would requeue-or-resume a task nothing may ever resume. The
+/// wrapper never returns (its restore-IF code is abandoned with the stack);
+/// the next task sets its own IF.
 pub fn exit() -> ! {
+    // Same reasoning as in `yield_now`.
     debug_assert!(
-        x86_64::instructions::interrupts::are_enabled(),
-        "exit called with interrupts disabled"
+        !crate::interrupts::in_interrupt(),
+        "exit called from interrupt context"
     );
-    let (old_rsp, new_rsp) = with_scheduler(|s| {
-        assert!(s.current.stack_top().is_some(), "the boot task cannot exit");
-        // The boot task never exits, so it is always queued while another
-        // task runs; an empty queue means the boot task was lost.
-        s.rotate(Outgoing::Retire)
-            .expect("last runnable task finished; no boot task to return to")
+    without_interrupts(|| {
+        let (old_rsp, new_rsp) = with_scheduler(|s| {
+            assert!(s.current.stack_top().is_some(), "the boot task cannot exit");
+            // The boot task never exits, so it is always queued while another
+            // task runs; an empty queue means the boot task was lost.
+            s.rotate(Outgoing::Retire)
+                .expect("last runnable task finished; no boot task to return to")
+        });
+        // Safety: as in `yield_now`; `old_rsp` stays valid because the task
+        // sits in `finished` until the next task's `reap`, which runs after
+        // this switch. The saved frame is never resumed: nothing queues a
+        // `Finished` task.
+        unsafe { switch(old_rsp, new_rsp) };
     });
-    // Safety: as in `yield_now`; `old_rsp` stays valid because the task sits
-    // in `finished` until the next task's `reap`, which runs after this
-    // switch. The saved frame is never resumed: nothing queues a `Finished` task.
-    unsafe { switch(old_rsp, new_rsp) };
     unreachable!("a finished task was switched back into");
 }
 
@@ -259,8 +310,9 @@ pub fn exit() -> ! {
 /// `entry`. Freeing takes the heap lock, which an ISR must never do (it may
 /// have interrupted the allocator holding that lock, a deadlock;
 /// `allocator::GuardedHeap` panics if it tries), so reaping must stay out of
-/// interrupt handlers. When timer preemption lands, the handler should only
-/// pick and switch; this still runs on the resumed task's mainline path.
+/// interrupt handlers. The timer ISR therefore only picks and switches; a
+/// task resumed by the ISR path doesn't reap, and its stacks wait for the next
+/// `yield_now` or fresh-task start.
 pub(crate) fn reap() {
     // One at a time, each dropped outside the lock: freeing takes the heap
     // lock and needn't nest. Popping (not `mem::take`) keeps `finished`'s
