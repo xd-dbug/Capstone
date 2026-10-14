@@ -2,7 +2,6 @@
 /kernel/target
 error.log
 /.claude
-CLAUDE.md
 /docs/
 /.vscode
 /docs/superpowers/specs/
