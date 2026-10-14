@@ -3,6 +3,7 @@
 #![feature(custom_test_frameworks)]
 #![test_runner(crate::test_runner)]
 #![feature(abi_x86_interrupt)]
+#![feature(allocator_api)] // `Box::try_new`: fallible task allocation in `scheduler::spawn`
 #![reexport_test_harness_main = "test_main"]
 
 extern crate alloc;
