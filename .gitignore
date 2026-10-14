@@ -6,3 +6,5 @@ CLAUDE.md
 /docs/
 /.vscode
 /docs/superpowers/specs/
+/.agents
+skills-lock.json
