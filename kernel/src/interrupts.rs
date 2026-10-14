@@ -6,7 +6,7 @@ use pic8259::ChainedPics;
 use spin::Mutex;
 use crate::print;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use lazy_static::lazy_static;
 
@@ -45,6 +45,48 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
+// Single core, so this only has to order against code on the same core.
+// Acquire on enter / Release on exit (free on x86) keeps the compiler from
+// moving work guarded by "we are in an ISR" outside the guard's lifetime.
+//
+// The depth describes the *currently running* context, not the CPU: any
+// code that switches tasks from inside an ISR must save it before `switch`
+// and restore it after, so each task resumes with its own depth (and a fresh
+// task starts at 0).
+static ISR_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// True while any `IsrGuard` is alive, i.e. we are inside an interrupt or
+/// exception handler. `allocator::GuardedHeap` panics on heap use when set.
+pub fn in_interrupt() -> bool {
+    ISR_DEPTH.load(Ordering::Acquire) != 0
+}
+
+/// RAII marker for "this code runs in interrupt context". Every handler
+/// (including any scheduler code the timer ISR calls) must create one first
+/// thing; it is a counter, not a flag, so nested handlers (e.g. a breakpoint
+/// inside the timer ISR) unwind correctly. Drop it only after the handler's
+/// last heap-free work, i.e. just let it fall out of scope at the end.
+///
+/// The guard lives on the interrupted task's stack, so dropping it early
+/// before a task switch is wrong: it would decrement again when that task
+/// resumes and its handler returns. Save/restore `ISR_DEPTH` around the
+/// switch instead (see the comment on `ISR_DEPTH`).
+#[must_use = "the guard marks interrupt context only while it is alive"]
+pub struct IsrGuard(());
+
+impl IsrGuard {
+    pub fn enter() -> Self {
+        ISR_DEPTH.fetch_add(1, Ordering::Acquire);
+        IsrGuard(())
+    }
+}
+
+impl Drop for IsrGuard {
+    fn drop(&mut self) {
+        ISR_DEPTH.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// Installs the IDT so the CPU starts routing exceptions/interrupts through it.
 pub fn init_idt() {
     IDT.load();
@@ -54,6 +96,7 @@ pub fn init_idt() {
 extern "x86-interrupt" fn breakpoint_handler(
     stack_frame: InterruptStackFrame)
 {
+    let _isr = IsrGuard::enter();
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
@@ -62,6 +105,7 @@ extern "x86-interrupt" fn breakpoint_handler(
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame, _error_code: u64) -> !
 {
+    let _isr = IsrGuard::enter();
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 /// Page faults are unrecoverable here (no demand paging/heap growth yet), so
@@ -73,6 +117,7 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    let _isr = IsrGuard::enter();
     println!("EXCEPTION: PAGE FAULT");
     println!("Accessed Address: {:?}", Cr2::read());
     println!("Error Code: {:?}", error_code);
@@ -116,6 +161,7 @@ pub fn ticks() -> u64 {
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
+    let _isr = IsrGuard::enter();
     TICKS.fetch_add(1, Ordering::Relaxed);
 
     // Without this, the PIC's in-service bit for IRQ0 never clears, so it
@@ -142,6 +188,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
 {
     use x86_64::instructions::port::Port;
 
+    let _isr = IsrGuard::enter();
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
 
@@ -171,4 +218,19 @@ fn test_timer_ticks_increase() {
         x86_64::instructions::hlt();
     }
     assert!(ticks() > start);
+}
+
+#[test_case]
+fn test_isr_guard_nests_and_clears() {
+    assert!(!in_interrupt());
+    {
+        let _outer = IsrGuard::enter();
+        assert!(in_interrupt());
+        {
+            let _inner = IsrGuard::enter();
+            assert!(in_interrupt());
+        }
+        assert!(in_interrupt());
+    }
+    assert!(!in_interrupt());
 }

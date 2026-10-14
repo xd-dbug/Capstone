@@ -1,4 +1,7 @@
+use crate::interrupts;
+use core::alloc::{GlobalAlloc, Layout};
 use linked_list_allocator::LockedHeap;
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
@@ -18,12 +21,69 @@ pub const HEAP_START: usize = 0xffff_c000_0000_0000;
 /// exactly this much and nothing resizes it afterward.
 pub const HEAP_SIZE: usize = 100 * 1024;
 
-/// `linked_list_allocator`'s `LockedHeap` is a `spin::Mutex` around the free
-/// list internally, so unlike `MAPPER`/`FRAME_ALLOCATOR` it doesn't need a
-/// separate `OnceCell` wrapper — `empty()` is a valid uninitialized starting
-/// state, and `init_heap` below fills it in exactly once.
+/// `#[global_allocator]` wrapper that makes "no heap use in interrupt
+/// context" a loud, checked rule instead of a silent deadlock.
+///
+/// `LockedHeap` is a non-reentrant `spin::Mutex`: if an ISR allocates or
+/// frees while the interrupted mainline code holds it, the ISR spins forever
+/// on a single core. Two layers guard against that:
+///
+/// 1. **Detection (the policy).** Every call first checks
+///    `interrupts::in_interrupt()` (a depth counter bumped by
+///    `interrupts::IsrGuard`) and panics if set. Chosen over masking alone
+///    because masking would make an ISR allocation *work*, hiding a design
+///    bug that still costs unbounded latency in the handler and fragments the
+///    heap from IRQ timing. The check runs before the lock is touched and the
+///    panic message is a static `&str`, so the panic path itself never
+///    allocates or takes the heap lock. Cost: every ISR must hold an
+///    `IsrGuard`; an ISR without one is not detected.
+/// 2. **Masking (the backstop).** The heap lock is only ever held with
+///    interrupts disabled, so an ISR can never observe it held, even one
+///    that forgot its guard. Tradeoff: IRQ latency grows by the duration of
+///    one heap operation (bounded; the free list is walked linearly). This
+///    does not cover synchronous exceptions (#PF etc.), which `cli` cannot
+///    defer; those handlers carry guards too.
+///
+/// Panicking inside `GlobalAlloc` is only sound because the kernel is built
+/// with `panic-strategy: abort` and a diverging `#[panic_handler]`: unwinding
+/// out of an allocator is UB.
+struct GuardedHeap(LockedHeap);
+
+#[cold]
+#[inline(never)]
+fn heap_in_interrupt() -> ! {
+    panic!("heap allocation or free attempted in interrupt context");
+}
+
+unsafe impl GlobalAlloc for GuardedHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if interrupts::in_interrupt() {
+            heap_in_interrupt();
+        }
+        // Safety: forwarded unchanged under the caller's `GlobalAlloc` contract.
+        without_interrupts(|| unsafe { self.0.alloc(layout) })
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if interrupts::in_interrupt() {
+            heap_in_interrupt();
+        }
+        // Safety: forwarded unchanged under the caller's `GlobalAlloc` contract.
+        without_interrupts(|| unsafe { self.0.dealloc(ptr, layout) })
+    }
+}
+
+/// Bytes currently allocated from the kernel heap. For tests that check
+/// memory is actually returned (e.g. task stacks after exit); exact, unlike
+/// probing with trial allocations.
+pub fn used_bytes() -> usize {
+    without_interrupts(|| ALLOCATOR.0.lock().used())
+}
+
+/// `empty()` is a valid uninitialized starting state; `init_heap` below
+/// fills it in exactly once.
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: GuardedHeap = GuardedHeap(LockedHeap::empty());
 
 /// Maps the fixed `HEAP_START..HEAP_START + HEAP_SIZE` virtual range to
 /// freshly allocated physical frames and hands the whole range to
@@ -58,7 +118,7 @@ pub fn init_heap(
     // mapped writable above, and this is the only place that ever calls
     // `init` on `ALLOCATOR`, so no other code can be using this memory yet.
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+        ALLOCATOR.0.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
     Ok(())

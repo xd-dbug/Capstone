@@ -27,3 +27,7 @@ harness = false
 [[test]]
 name = "page_fault"
 harness = false
+
+[[test]]
+name = "isr_heap_safety"
+harness = false
