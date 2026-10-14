@@ -52,7 +52,7 @@ pub static PICS: Mutex<ChainedPics> =
 // The depth describes the *currently running* context, not the CPU: any
 // code that switches tasks from inside an ISR must save it before `switch`
 // and restore it after, so each task resumes with its own depth (and a fresh
-// task starts at 0).
+// task starts at 0). `switch_from_isr` is that one place.
 static ISR_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// True while any `IsrGuard` is alive, i.e. we are inside an interrupt or
@@ -85,6 +85,34 @@ impl Drop for IsrGuard {
     fn drop(&mut self) {
         ISR_DEPTH.fetch_sub(1, Ordering::Release);
     }
+}
+
+/// Switches tasks from inside an interrupt handler, keeping `ISR_DEPTH`
+/// per-task. The preempted task's `IsrGuard` stays alive on its own stack
+/// across the switch (dropping it early would decrement a second time when the
+/// task resumes and its handler returns), so instead the depth is parked in a
+/// local on that same stack: the incoming context starts at 0 (a fresh task
+/// is plain mainline code; a cooperatively yielded one never was in an ISR),
+/// or, if it was itself preempted, restores its own saved depth right after
+/// its `switch` returns, below.
+///
+/// Both `swap` and `store` run with interrupts masked (the handler's gate
+/// cleared IF, and the resumed side is still inside its handler), so nothing
+/// can observe the transient 0.
+///
+/// # Safety
+/// Everything `context::switch` requires, and the caller must be an interrupt
+/// handler running on the interrupted task's own stack that has already sent
+/// its EOI and holds no locks.
+pub(crate) unsafe fn switch_from_isr(
+    old_rsp: *mut x86_64::VirtAddr,
+    new_rsp: x86_64::VirtAddr,
+) {
+    let saved_depth = ISR_DEPTH.swap(0, Ordering::AcqRel);
+    // Safety: forwarded under this function's contract.
+    unsafe { crate::context::switch(old_rsp, new_rsp) };
+    // Only reached when this task is resumed, on its own stack.
+    ISR_DEPTH.store(saved_depth, Ordering::Release);
 }
 
 /// Installs the IDT so the CPU starts routing exceptions/interrupts through it.
@@ -158,6 +186,73 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Input clock of the 8253/8254 PIT, in Hz (fixed by the hardware).
+const PIT_BASE_HZ: u32 = 1_193_182;
+
+/// Timer interrupt rate, and so the preemption time slice (10 ms). The PIT's
+/// power-on rate of ~18.2 Hz would give 55 ms slices, which makes tasks feel
+/// sluggish and slows tick-based tests; 100 Hz is slow enough that the ISR
+/// overhead is negligible and fast enough for sub-second fairness checks.
+/// The divisor is rounded, so the real rate is 1193182 / 11932 = 99.998 Hz.
+pub const TIMER_HZ: u32 = 100;
+
+/// Programs PIT channel 0 to fire IRQ0 at `TIMER_HZ`. Like the PIC setup, it
+/// must run before interrupts are enabled so the first tick already arrives at
+/// the new rate.
+pub fn init_pit() {
+    use x86_64::instructions::port::Port;
+
+    let divisor = (PIT_BASE_HZ + TIMER_HZ / 2) / TIMER_HZ;
+    assert!(divisor <= u16::MAX as u32, "PIT divisor must fit in 16 bits");
+    let mut command: Port<u8> = Port::new(0x43);
+    let mut channel0: Port<u8> = Port::new(0x40);
+    // Safety: standard PIT ports; no other code touches them. 0x34 = channel
+    // 0, low byte then high byte, mode 2 (rate generator: a periodic pulse),
+    // binary counting.
+    unsafe {
+        command.write(0x34);
+        channel0.write(divisor as u8);
+        channel0.write((divisor >> 8) as u8);
+    }
+}
+
+/// IRQ0: counts the tick, acknowledges it, then preempts the running task if
+/// preemption is on and another task is ready.
+///
+/// Why a plain `x86-interrupt` handler can switch tasks directly, instead of
+/// a naked stub that pushes every register:
+/// - The `x86-interrupt` ABI (LLVM's `x86_intrcc`) preserves *every* register
+///   the handler body or anything it calls clobbers, saving them in the
+///   prologue and restoring them in the epilogue, which is what makes it safe
+///   to interrupt code that made no `call`. The interrupted task's rax, rcx,
+///   rdx, rsi, rdi, r8-r11 therefore sit on its own stack above `switch`'s
+///   frame; `switch` saves rbx, rbp, r12-r15 itself; rip, cs, rflags, rsp and
+///   ss are in the CPU's interrupt frame. Together that is the full context.
+///   `tests/preemption.rs` checks it by spinning on known values in all of
+///   them.
+/// - No vector state: the target (`x86_64-seal_os.json`) is `-sse,+soft-float`
+///   so the kernel never touches xmm/mmx/x87 registers and there is nothing
+///   more to save. (User tasks, if they ever use SSE, will need this revisited.)
+/// - IRQ0 has no IST entry and this is ring 0 to ring 0, so the CPU pushes the
+///   interrupt frame onto the interrupted task's own stack. Switching away
+///   leaves that frame intact there, and resuming the task later simply
+///   returns through this function's epilogue and `iretq`, which also restores
+///   the task's own RFLAGS (so IF is per-task for preempted tasks).
+///
+/// Order matters:
+/// 1. EOI before switching. Otherwise the PIC's in-service bit for IRQ0 stays
+///    set while the next task runs, and the timer never fires again.
+/// 2. Nothing here may allocate, free, reap or print: the handler may have
+///    interrupted the allocator or a print mid-operation. `select_next` is
+///    allocation-free and takes only the scheduler lock, which mainline code
+///    only ever holds with interrupts masked, so the ISR can never find it
+///    held. `GuardedHeap` panics if this rule is broken. Mainline locks held
+///    with interrupts enabled (e.g. a test's log mutex) can be preempted
+///    while held; that merely makes the next task that wants it spin until
+///    the holder is rescheduled (each spinner is itself preempted in turn),
+///    so it costs time, not correctness.
+/// 3. `_isr` is not dropped before the switch; `switch_from_isr` saves and
+///    restores `ISR_DEPTH` around it instead.
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
@@ -165,9 +260,22 @@ extern "x86-interrupt" fn timer_interrupt_handler(
     TICKS.fetch_add(1, Ordering::Relaxed);
 
     // Without this, the PIC's in-service bit for IRQ0 never clears, so it
-    // never delivers another timer interrupt after this one.
+    // never delivers another timer interrupt after this one. The lock is
+    // dropped at the end of the statement, before any switch.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+
+    if !crate::scheduler::preemption_enabled() {
+        return;
+    }
+    // IF is still 0 (interrupt gate), which `select_next` requires through
+    // `switch`, so no other tick can select again in between.
+    if let Some((old_rsp, new_rsp)) = crate::scheduler::select_next() {
+        // Safety: same contract as `yield_now`'s switch; in addition this is
+        // a handler on the interrupted task's own stack, EOI is sent and no
+        // lock is held.
+        unsafe { switch_from_isr(old_rsp, new_rsp) };
     }
 }
 

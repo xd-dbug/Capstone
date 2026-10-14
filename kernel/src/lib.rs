@@ -64,8 +64,10 @@ pub trait Testable {
 /// Brings up CPU-level state needed before anything else can run safely:
 /// segment/TSS descriptors, then the interrupt handlers that depend on them,
 /// then the PICs (remapped to vectors 32+ so they can't collide with CPU
-/// exception vectors 0-31), then the frame allocator, page-table mapper, and
-/// heap (in that order, each needing the one before it), and finally
+/// exception vectors 0-31) and the PIT that drives IRQ0, then the frame
+/// allocator, page-table mapper, and heap (in that order, each needing the
+/// one before it), the scheduler (needs the heap; turns timer preemption on),
+/// and finally
 /// interrupts themselves — enabling them any earlier would let a hardware IRQ
 /// arrive before its handler or the remapped PIC vectors are in place.
 ///
@@ -84,6 +86,8 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
     // master PIC; the slave PIC's cascade line (IRQ2) and everything else
     // stays masked since no other device is wired up yet.
     unsafe { interrupts::PICS.lock().write_masks(0xFC, 0xFF) }
+    // Before `sti` so the very first tick already arrives at `TIMER_HZ`.
+    interrupts::init_pit();
     let allocator = unsafe { memory::BootInfoFrameAllocator::init(memory_regions, VirtAddr::new(physical_memory_offset)) };
     memory::FRAME_ALLOCATOR.init_once(|| Mutex::new(allocator));
     memory::MAPPER.init_once(|| {
@@ -107,7 +111,9 @@ pub fn init(physical_memory_offset: u64, memory_regions: &'static MemoryRegions)
             .lock(),
     )
     .expect("heap initialization failed");
-    // Allocates the boot task's `Box`, so it must follow `init_heap`.
+    // Allocates the boot task's `Box`, so it must follow `init_heap`, and
+    // must precede `sti`: it also switches timer preemption on, and the
+    // timer ISR must never be the one to lazily initialize the scheduler.
     scheduler::init();
     x86_64::instructions::interrupts::enable();
 }

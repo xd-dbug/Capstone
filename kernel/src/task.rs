@@ -37,7 +37,7 @@ impl TaskId {
     }
 }
 
-/// Minimal set for cooperative yielding (`scheduler::yield_now`). No `Blocked`
+/// Minimal set for scheduling (`scheduler::yield_now`, timer preemption). No `Blocked`
 /// yet; add it once something can actually block (I/O, locks). No `Ord`: states have no
 /// meaningful ordering, only equality.
 #[derive(PartialEq, Eq, Debug)]
@@ -60,16 +60,18 @@ pub enum TaskState {
 /// moved `rsp` off it.
 pub struct Task {
     id: TaskId,
-    /// The only saved CPU state, no register array. The switch is
-    /// cooperative (a task calls `switch` itself), so per the SysV calling
-    /// convention only the callee-saved registers (rbx, rbp, r12-r15) must
-    /// survive. `switch` pushes them onto the outgoing task's own stack, then
-    /// stores `rsp` here; restoring is load `rsp`, pop in reverse order,
-    /// `ret` (popping the return address pushed by the original `call`). So
-    /// this *is* the pointer to the saved registers. Virtual because `rsp` is
-    /// always virtual once paging is on; all kernel threads share one page
-    /// table at Layer 4, so it stays valid across switches. Preemptive
-    /// switching from a timer IRQ would need all registers saved (W2).
+    /// The only saved CPU state, no register array. `switch` is an ordinary
+    /// call, so per the SysV calling convention only the callee-saved
+    /// registers (rbx, rbp, r12-r15) must survive. `switch` pushes them onto
+    /// the outgoing task's own stack, then stores `rsp` here; restoring is
+    /// load `rsp`, pop in reverse order, `ret` (popping the return address
+    /// pushed by the original `call`). So this *is* the pointer to the saved
+    /// registers. For a task preempted by the timer, the rest of its context
+    /// (the other GPRs, RFLAGS incl. IF, rip) sits further up the same stack
+    /// in the interrupt handler's frame, which the resume unwinds through
+    /// `iretq`. Virtual because `rsp` is always virtual once paging is on;
+    /// all kernel threads share one page table at Layer 4, so it stays valid
+    /// across switches.
     saved_rsp: VirtAddr,
     /// `None` for the boot task, which runs on the bootloader's stack. That
     /// memory isn't from the kernel heap and must never be handed to the heap

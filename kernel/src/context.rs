@@ -4,16 +4,24 @@ use x86_64::VirtAddr;
 /// Number of callee-saved registers `switch` pushes (rbx, rbp, r12-r15).
 const SAVED_REGS: usize = 6;
 
-/// Cooperative context switch: saves the outgoing task's callee-saved
-/// registers on its own stack, stores `rsp` into `*old_rsp`, loads `new_rsp`,
-/// and restores the incoming task's registers from that stack.
+/// Context switch: saves the outgoing task's callee-saved registers on its
+/// own stack, stores `rsp` into `*old_rsp`, loads `new_rsp`, and restores the
+/// incoming task's registers from that stack.
 ///
 /// Only the callee-saved registers need saving because `switch` is an
 /// ordinary `extern "C"` call from the compiler's point of view: it already
 /// assumes rax, rcx, rdx, rsi, rdi, r8-r11 (and flags) are clobbered across
-/// any call. A preemptive switch from a timer IRQ (W2) interrupts code that
-/// made no such call, so it would have to save everything, via the interrupt
-/// frame.
+/// any call. That also holds for a switch made from the timer ISR: the
+/// `x86-interrupt` handler is the caller, and the interrupt ABI saves
+/// everything such a call clobbers (see `interrupts::timer_interrupt_handler`
+/// for the full argument). Nothing here needs a special preemption path.
+///
+/// RFLAGS is deliberately not saved here: the interrupt flag is per-task
+/// state carried by whichever mechanism suspended the task. A preempted task
+/// has its RFLAGS in the interrupt frame and resumes through `iretq`; a
+/// cooperative yielder resumes inside `without_interrupts`, which restores
+/// the IF it started with; a fresh task has no IF yet, and `task_trampoline`
+/// enables it.
 ///
 /// Naked because a normal function gets a compiler-generated prologue and
 /// epilogue that would touch `rsp` (and possibly callee-saved registers)
@@ -27,10 +35,15 @@ const SAVED_REGS: usize = 6;
 /// - `new_rsp` must point at a frame laid out by a previous `switch` out of
 ///   that stack, or by `init_stack`, and that stack must still be alive and
 ///   not currently running.
-/// - Must not be called from an interrupt handler: the IRQ's own frame and
-///   the PIC end-of-interrupt state would be stranded on the old stack.
-/// - Do not hold a spinlock across the call (the other task could spin on it
-///   forever, as there is no preemption).
+/// - Interrupts must stay off from the scheduler's selection through this
+///   call (see `scheduler::select_next`), or a tick could select again before
+///   `*old_rsp` is written.
+/// - From an interrupt handler it is only valid when the handler runs on the
+///   interrupted task's own stack (so the frame is parked there), has already
+///   sent its EOI (the PIC would otherwise never fire again for the next
+///   task), and manages `ISR_DEPTH` via `interrupts::switch_from_isr`.
+/// - Do not hold a spinlock across the call: the resumed task could spin on
+///   it forever, as the holder can't run until someone switches back.
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(old_rsp: *mut VirtAddr, new_rsp: VirtAddr) {
     naked_asm!(
@@ -61,6 +74,15 @@ pub unsafe extern "C" fn switch(old_rsp: *mut VirtAddr, new_rsp: VirtAddr) {
 /// parks the entry function in the rbx slot, so the `pop rbx` before that
 /// `ret` has loaded it here.
 ///
+/// Starts with `sti`: arriving here, IF may be 0, because the switch came
+/// from inside the timer ISR (IF cleared by the gate) or from `yield_now`'s
+/// masked window, and a fresh task has no saved RFLAGS to restore. Doing it
+/// here (rather than seeding an RFLAGS image in `init_stack`'s frame, which
+/// `switch`'s `ret` can't load without extra frame layout) keeps the frame
+/// format unchanged and makes every new task start preemptible by
+/// construction. The switch has already stored the outgoing rsp by now, so
+/// the select-to-switch window is closed. `ISR_DEPTH` is already 0.
+///
 /// A trampoline (rather than putting `entry` directly in the return slot)
 /// gives a defined place to land if the entry returns, instead of `ret`ing
 /// into whatever garbage sits above the stack top. At this point
@@ -69,6 +91,9 @@ pub unsafe extern "C" fn switch(old_rsp: *mut VirtAddr, new_rsp: VirtAddr) {
 #[unsafe(naked)]
 unsafe extern "C" fn task_trampoline() -> ! {
     naked_asm!(
+        // Per-task IF for a fresh task; see above. Before `task_started` so
+        // reaping and `entry` both run preemptible.
+        "sti",
         // rbx (callee-saved) survives the first call and still holds `entry`.
         // rsp is 16-aligned here, so both calls satisfy the SysV alignment.
         "call {started}",

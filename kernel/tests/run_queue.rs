@@ -24,6 +24,10 @@ fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
         kernel::framebuffer::init(framebuffer);
     }
     kernel::init(physical_memory_offset, memory_regions);
+    // These tests assert exact interleavings and counts that a timer tick
+    // between a log push and a `yield_now` would reorder. Only one task
+    // exists until the first `spawn`, so a tick before this line can't switch.
+    kernel::scheduler::set_preemption(false);
     test_main();
     loop {}
 }
